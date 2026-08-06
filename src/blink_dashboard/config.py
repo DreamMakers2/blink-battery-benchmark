@@ -59,6 +59,7 @@ class ExperimentConfig:
     battery_poll_seconds: float = 300.0
     measurement_interval_seconds: float = 300.0
     stream_checkpoint_seconds: float = 5.0
+    stream_data_timeout_seconds: float = 20.0
     fatal_outage_seconds: float = 3_600.0
     development_mode: bool = False
     tests: tuple[ExperimentTestConfig, ...] = field(default_factory=_default_tests)
@@ -233,10 +234,21 @@ def _build_config(data: Mapping[str, Any], root: Path) -> AppConfig:
         "battery_poll_seconds",
         "measurement_interval_seconds",
         "stream_checkpoint_seconds",
+        "stream_data_timeout_seconds",
         "fatal_outage_seconds",
     ):
         if key in experiment_data:
             experiment_data[key] = _positive(f"experiment.{key}", experiment_data[key])
+    data_timeout = experiment_data.get(
+        "stream_data_timeout_seconds", defaults.experiment.stream_data_timeout_seconds
+    )
+    fatal_outage = experiment_data.get(
+        "fatal_outage_seconds", defaults.experiment.fatal_outage_seconds
+    )
+    if data_timeout > fatal_outage:
+        raise ValueError(
+            "experiment.stream_data_timeout_seconds cannot exceed experiment.fatal_outage_seconds"
+        )
     if tests_data is not None:
         tests: list[ExperimentTestConfig] = []
         for index, item in enumerate(tests_data, 1):

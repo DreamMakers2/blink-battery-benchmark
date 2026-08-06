@@ -23,7 +23,7 @@ On its first run, `launch.cmd`:
 7. Prompts for a camera when the account has multiple cameras, or when a previously selected camera is no longer available.
 8. Starts both loopback services and opens `http://127.0.0.1:8090` in the default browser.
 
-Later launches reuse the encrypted Blink session, selected camera, virtual environment, and managed dependency. If Blink invalidates the saved session, the launcher prompts again. MFA one-time codes are never saved.
+Later launches reuse the encrypted Blink session, selected camera, virtual environment, and managed dependency. When saved-session startup is temporarily unavailable, the adapter retains the encrypted record and retries automatically with capped exponential backoff. An ambiguous Blink or network failure never falls through to another username/password prompt. MFA is requested only when Blink explicitly reports that MFA is required, and one-time codes are never saved. To intentionally enter different credentials, close the dashboard and delete only `runtime/private/auth.dpapi` before launching again.
 
 The first setup needs internet access for Python packages, `blinkliveview`, and Blink authentication. Browser UI libraries, icons, styles, and fonts are served locally after checkout; the dashboard itself has no CDN dependency.
 
@@ -73,15 +73,17 @@ The committed defaults run these tests in order:
 1. A fresh snapshot every 300 seconds for up to 12 active hours.
 2. A fresh snapshot every 60 seconds for up to 12 active hours.
 3. A fresh snapshot every 30 seconds for up to 12 active hours.
-4. A continuously consumed live stream for up to 12 active hours.
+4. A continuously consumed live stream until 12 receipt-confirmed active hours have accumulated.
 
 A 12-hour recovery period separates completed tests. Recovery generates no snapshots and does not connect to the live stream, but battery polling and measurement recording continue.
 
-Active-test duration uses monotonic elapsed time and pauses while the application is closed or manually stopped. Recovery deadlines use wall-clock UTC, so a recovery period continues while the application is closed. The current run, open phase, counters, measurements, errors, and previous runs are durable in SQLite.
+Snapshot-test duration uses monotonic elapsed time and pauses while the application is closed or manually stopped. Continuous-stream duration advances only across adjacent positive byte receipts within the configured stream-data timeout: time before the first byte, disconnects, FFmpeg failures, silent stalls, and reconnect waits do not count toward the 12-hour result. Receipt-confirmed stream time and counters are checkpointed to SQLite and survive application restarts. Recovery deadlines use wall-clock UTC, so a recovery period continues while the application is closed. The current run, open phase, counters, measurements, errors, and previous runs are durable in SQLite.
 
 When a fresh Blink reading reports a configured low/replacement state, camera activity stops immediately and the run enters `stopped_low_battery`. Automatic recovery monitoring continues. “Continue with next test” first requires a new successful, non-low Blink reading; it cannot override a battery that is still reported low.
 
-Transient snapshot, battery, stream, and FFmpeg errors are retained and retried. A continuous critical outage longer than the configured fatal-outage interval moves the run to `stopped_error`.
+Transient snapshot, battery, stream, and FFmpeg errors are retained and retried. Stream health has its own outage clock, separate from successful battery or snapshot operations. It begins before the first stream byte and restarts after a disconnect, FFmpeg failure, or data-inactivity timeout; only new positive stream bytes clear it. The dashboard shows the current outage duration and fatal threshold. If the outage reaches `experiment.fatal_outage_seconds`, the run moves to `stopped_error` even while the internal media consumer is still retrying.
+
+An active stream outage is persisted immediately and checkpointed to SQLite. If the launcher closes or crashes while that outage is active, automatic startup includes the closed wall-clock interval in the same outage, so restarting cannot evade the fatal threshold. An intentional **Stop** is different: the accumulated outage is retained, but time spent manually paused is excluded. The first positive byte after a resume clears the carried outage without crediting the pause, outage, or reconnect gap as valid stream-test time. Stream battery checks run independently, so a slow or hung Blink request cannot delay outage enforcement.
 
 ## Controls
 
@@ -110,7 +112,7 @@ Configurable groups include:
 
 - `[server]`: dashboard host/port and explicit LAN opt-in.
 - `[blink]`: loopback HTTP/TCP endpoints, request timeouts, reconnect delay, and low-battery state names.
-- `[experiment]`: test/recovery durations, battery and measurement intervals, checkpoint cadence, fatal outage threshold, and the ordered test definitions.
+- `[experiment]`: test/recovery durations, battery and measurement intervals, checkpoint cadence, stream-data inactivity timeout, fatal outage threshold, and the ordered test definitions. `stream_data_timeout_seconds` must be positive and no greater than `fatal_outage_seconds`.
 - `[paths]`: runtime, SQLite, latest JPEG, HLS, private, and log locations.
 - `[media]`: FFmpeg executable and HLS segment/list settings.
 
@@ -168,7 +170,7 @@ node --check static/app.js
 
 On Windows, use `.venv\Scripts\python.exe` instead of `.venv/bin/python`.
 
-The test suite covers configuration validation, SQLite migrations and rollback, restart recovery, snapshot scheduling, low-battery transitions, timeout/failure classification, stream checkpoints, encrypted secret envelopes, adapter contracts, JPEG/media behavior, HTTP APIs, supervisor readiness, static accessibility, local icons, and transitive stylesheet imports.
+The test suite covers configuration validation, SQLite migrations and rollback, restart recovery, snapshot scheduling, low-battery transitions, timeout/failure classification, receipt-confirmed stream timing, zero-byte and FFmpeg fatal outages, stream checkpoints across restart, encrypted secret envelopes, saved-auth retry/prompt isolation, adapter contracts, JPEG/media behavior, HTTP APIs, supervisor readiness, static accessibility, local icons, and transitive stylesheet imports.
 
 ## Troubleshooting
 
@@ -184,6 +186,10 @@ Confirm `ffmpeg -version` works in a newly opened Command Prompt. Merely placing
 
 The encrypted file belongs to a different Windows user, or it is damaged. Close the application, remove `runtime/private/auth.dpapi`, and launch again to authenticate. Experiment data in `runtime/data/experiment.db` is unaffected.
 
+**Saved authentication keeps retrying**
+
+Blinkpy does not reliably distinguish rejected credentials from temporary network, throttling, service, or camera-discovery failures during startup. The dashboard therefore retains the last encrypted record and retries at 2, 4, 8, and then up to 60-second intervals instead of requesting the username/password again. Leave the launcher open while Blink recovers. MFA appears only after Blink explicitly requests it. If the account credentials really changed, close the dashboard, delete only `runtime/private/auth.dpapi`, and launch again for an intentional fresh sign-in.
+
 **The browser did not open**
 
 Leave the launcher running and open `http://127.0.0.1:8090` manually.
@@ -194,7 +200,7 @@ If another compatible dashboard is already running, the launcher opens it. Other
 
 **Camera output is stale**
 
-The timestamp below the camera is the last successfully received media time. Snapshot failures never replace the last valid JPEG. During stream startup or reconnection, the page intentionally falls back to the latest snapshot.
+The timestamp below the camera is the last successfully received media time. Snapshot failures never replace the last valid JPEG. During stream startup or reconnection, the page intentionally falls back to the latest snapshot. The “Stream reception” and “Current stream outage” readings show whether bytes are currently arriving and how close the outage is to the fatal threshold; stalled time does not reduce the remaining valid stream-test duration.
 
 **Where are detailed failures?**
 

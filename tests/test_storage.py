@@ -13,7 +13,7 @@ NOW = datetime(2026, 8, 6, 12, 30, tzinfo=timezone.utc)
 
 def test_database_uses_wal_and_preserves_run_history(tmp_path):
     storage = SQLiteStorage(tmp_path / "nested" / "experiment.db")
-    assert storage.schema_version == 2
+    assert storage.schema_version == 3
     assert storage._connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
 
     first = storage.create_run(now=NOW)
@@ -93,6 +93,16 @@ def test_constraints_and_update_field_allowlist(tmp_path):
         storage.update_run(run.id, made_up=True)
     with pytest.raises(sqlite3.IntegrityError):
         storage.update_run(run.id, current_test_number=5)
+    updated = storage.update_run(
+        run.id,
+        stream_outage_seconds=12.5,
+        stream_outage_active=True,
+        stream_outage_checkpoint_at_utc=NOW,
+        now=NOW,
+    )
+    assert updated.stream_outage_seconds == 12.5
+    assert updated.stream_outage_active is True
+    assert updated.stream_outage_checkpoint_at_utc == NOW
 
 
 def test_event_query_is_capped_and_newest_first(tmp_path):
@@ -136,7 +146,7 @@ def test_schema_v1_migrates_timeout_counters_without_losing_rows(tmp_path):
     connection.close()
 
     storage = SQLiteStorage(database)
-    assert storage.schema_version == 2
+    assert storage.schema_version == 3
     assert tuple(
         storage._connection.execute(
             "SELECT snapshots_attempted, snapshots_failed, snapshot_timeouts FROM runs"
@@ -147,3 +157,32 @@ def test_schema_v1_migrates_timeout_counters_without_losing_rows(tmp_path):
             "SELECT snapshots_attempted, snapshots_failed, snapshot_timeouts FROM measurements"
         ).fetchone()
     ) == (3, 1, 0)
+
+
+def test_schema_v2_migrates_durable_stream_outage_state(tmp_path):
+    database = tmp_path / "v2.db"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE runs (
+            id INTEGER PRIMARY KEY,
+            state TEXT NOT NULL,
+            created_at_utc TEXT NOT NULL,
+            updated_at_utc TEXT NOT NULL
+        );
+        INSERT INTO runs VALUES (
+            1, 'running_stream', '2026-08-06T00:00:00Z', '2026-08-06T00:00:00Z'
+        );
+        PRAGMA user_version = 2;
+        """
+    )
+    connection.close()
+
+    storage = SQLiteStorage(database)
+    assert storage.schema_version == 3
+    row = storage._connection.execute(
+        """SELECT stream_outage_seconds, stream_outage_active,
+                  stream_outage_checkpoint_at_utc
+           FROM runs WHERE id = 1"""
+    ).fetchone()
+    assert tuple(row) == (0.0, 0, None)

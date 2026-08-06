@@ -66,6 +66,7 @@ class HlsStreamConsumer:
         hls_dir: Path,
         ffmpeg: str = "ffmpeg",
         connect_timeout: float = 10,
+        read_timeout: float = 20,
         reconnect_delay: float = 2,
         segment_seconds: int = 2,
         list_size: int = 6,
@@ -75,6 +76,9 @@ class HlsStreamConsumer:
         self.hls_dir = hls_dir
         self.ffmpeg = ffmpeg
         self.connect_timeout = connect_timeout
+        if read_timeout <= 0:
+            raise ValueError("read_timeout must be greater than zero")
+        self.read_timeout = read_timeout
         self.reconnect_delay = reconnect_delay
         self.segment_seconds = segment_seconds
         self.list_size = list_size
@@ -174,19 +178,23 @@ class HlsStreamConsumer:
         on_error: AsyncCallback | None = None,
     ) -> None:
         """Run until *stop_event* is set, reconnecting without a second stream client."""
-        await self._start_ffmpeg()
         reconnects = 0
         try:
             while not stop_event.is_set():
+                waiting_for_data = False
                 try:
+                    await self._start_ffmpeg()
                     self._reader, self._writer = await asyncio.wait_for(
                         asyncio.open_connection(self.host, self.port), self.connect_timeout
                     )
+                    waiting_for_data = True
                     if reconnects:
                         await _invoke(on_reconnect)
                     reconnects += 1
                     while not stop_event.is_set():
-                        chunk = await asyncio.wait_for(self._reader.read(64 * 1024), timeout=20)
+                        chunk = await asyncio.wait_for(
+                            self._reader.read(64 * 1024), timeout=self.read_timeout
+                        )
                         if not chunk:
                             raise ConnectionError("Blink stream closed")
                         if (
@@ -201,24 +209,38 @@ class HlsStreamConsumer:
                         await _invoke(on_bytes, len(chunk), self.last_data_at)
                 except asyncio.CancelledError:
                     raise
+                except asyncio.TimeoutError:
+                    ffmpeg_failed = self.process is None or self.process.returncode is not None
+                    if ffmpeg_failed:
+                        category = "ffmpeg_failure"
+                        message = "FFmpeg exited while waiting for stream data"
+                    elif waiting_for_data:
+                        category = "stream_inactivity"
+                        message = f"No stream data received for {self.read_timeout:g} seconds"
+                    else:
+                        category = "stream_disconnect"
+                        message = (
+                            f"Stream connection timed out after {self.connect_timeout:g} seconds"
+                        )
+                    await _invoke(on_error, category, message)
+                    await self._recover_after_failure(stop_event, ffmpeg_failed)
                 except Exception as exc:  # reconnect path is intentionally broad
                     ffmpeg_failed = self.process is None or self.process.returncode is not None
                     category = "ffmpeg_failure" if ffmpeg_failed else "stream_disconnect"
                     await _invoke(on_error, category, str(exc))
-                    await self._close_socket()
-                    if ffmpeg_failed and not stop_event.is_set():
-                        await self._stop_ffmpeg()
-                        try:
-                            await self._start_ffmpeg()
-                        except Exception as restart_error:
-                            await _invoke(on_error, "ffmpeg_failure", str(restart_error))
-                    if not stop_event.is_set():
-                        try:
-                            await asyncio.wait_for(stop_event.wait(), self.reconnect_delay)
-                        except asyncio.TimeoutError:
-                            pass
+                    await self._recover_after_failure(stop_event, ffmpeg_failed)
         finally:
             await self.stop()
+
+    async def _recover_after_failure(self, stop_event: asyncio.Event, ffmpeg_failed: bool) -> None:
+        await self._close_socket()
+        if ffmpeg_failed:
+            await self._stop_ffmpeg()
+        if not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), self.reconnect_delay)
+            except asyncio.TimeoutError:
+                pass
 
     async def _close_socket(self) -> None:
         if self._writer:

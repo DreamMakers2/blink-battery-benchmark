@@ -9,7 +9,7 @@ from enum import Enum
 import hmac
 import logging
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Callable
 
 from aiohttp import web
 
@@ -58,13 +58,13 @@ class LocalExperimentBackend:
         self.client = client
         self.latest_snapshot_at_utc: str | None = None
         self.last_battery: BatteryReading | None = None
-        self.on_media_error: Callable[[str, str], Awaitable[None] | None] | None = None
         self.stream = HlsStreamConsumer(
             host=config.blink.stream_host,
             port=config.blink.stream_port,
             hls_dir=config.paths.hls_dir,
             ffmpeg=config.media.ffmpeg_executable,
             connect_timeout=config.blink.stream_connect_timeout_seconds,
+            read_timeout=config.experiment.stream_data_timeout_seconds,
             reconnect_delay=config.blink.stream_reconnect_seconds,
             segment_seconds=config.media.hls_segment_seconds,
             list_size=config.media.hls_list_size,
@@ -96,6 +96,7 @@ class LocalExperimentBackend:
         on_bytes: Callable[[int], None],
         stop_event: asyncio.Event,
         on_reconnect: Callable[[], None],
+        on_error: Callable[[str, str], None],
     ) -> None:
         async def count_bytes(count: int, _received_at: str) -> None:
             on_bytes(count)
@@ -104,15 +105,8 @@ class LocalExperimentBackend:
             stop_event,
             on_bytes=count_bytes,
             on_reconnect=on_reconnect,
-            on_error=self._stream_error,
+            on_error=on_error,
         )
-
-    async def _stream_error(self, category: str, message: str) -> None:
-        LOGGER.warning("%s: %s", category, message)
-        if self.on_media_error is not None:
-            result = self.on_media_error(category, message)
-            if asyncio.iscoroutine(result):
-                await result
 
     async def stop(self) -> None:
         await self.stream.stop()
@@ -149,18 +143,7 @@ class DashboardApplication:
             self.backend,
             low_battery_states=config.blink.low_battery_states,
         )
-        self.backend.on_media_error = self.record_media_error
         self.last_adapter_health: dict[str, Any] = {}
-
-    def record_media_error(self, category: str, message: str) -> None:
-        run = self.experiment.current_run
-        self.storage.add_event(
-            run_id=run.id,
-            test_number=run.current_test_number,
-            level="warning",
-            category=category,
-            message=message,
-        )
 
     async def start(self) -> None:
         await self.client.start()
@@ -247,6 +230,12 @@ class DashboardApplication:
                 "snapshot_timeout_count": run.snapshot_timeouts,
                 "received_stream_bytes": run.stream_bytes,
                 "stream_reconnect_count": run.stream_reconnects,
+            },
+            "stream": {
+                "receiving": status.stream_receiving,
+                "outage_seconds": status.stream_outage_seconds,
+                "fatal_outage_seconds": status.stream_fatal_outage_seconds,
+                "data_timeout_seconds": self.config.experiment.stream_data_timeout_seconds,
             },
             "media": {
                 "mode": "stream" if state == ExperimentState.RUNNING_STREAM else "snapshot",

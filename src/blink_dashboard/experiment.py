@@ -54,6 +54,7 @@ class ExperimentBackend(Protocol):
         on_bytes: Callable[[int], None],
         stop_event: asyncio.Event,
         on_reconnect: Callable[[], None],
+        on_error: Callable[[str, str], None],
     ) -> None:
         """Run one stream connection until stopped, EOF, or failure."""
 
@@ -84,6 +85,9 @@ class ExperimentStatus:
     active_remaining_seconds: float | None
     recovery_remaining_seconds: float | None
     runner_active: bool
+    stream_receiving: bool
+    stream_outage_seconds: float | None
+    stream_fatal_outage_seconds: float
 
 
 class SnapshotSchedule:
@@ -131,6 +135,10 @@ class ExperimentRunner:
     ):
         self.storage = storage
         self.config = config
+        if config.stream_data_timeout_seconds <= 0:
+            raise ValueError("stream_data_timeout_seconds must be greater than zero")
+        if config.stream_data_timeout_seconds > config.fatal_outage_seconds:
+            raise ValueError("stream_data_timeout_seconds cannot exceed fatal_outage_seconds")
         self.backend = backend
         self.clock = clock or SystemClock()
         self.low_battery_states = {
@@ -149,6 +157,10 @@ class ExperimentRunner:
         self._last_battery: BatteryReading | None = None
         self._last_measurement_at: float | None = None
         self._outage_started: float | None = None
+        self._stream_outage_started: float | None = None
+        self._last_stream_bytes_at: float | None = None
+        self._pending_stream_valid_seconds = 0.0
+        self._pending_stream_errors: list[tuple[str, str]] = []
         self._stream_stop_event: asyncio.Event | None = None
         self._pending_stream_bytes = 0
         self._pending_stream_reconnects = 0
@@ -176,6 +188,8 @@ class ExperimentRunner:
                 0.0,
                 (self._run.phase_deadline_at_utc - self.clock.now()).total_seconds(),
             )
+        stream_receiving = self._stream_is_receiving()
+        stream_outage = self._stream_outage_duration()
         return ExperimentStatus(
             run=self._run,
             test_name=test.name,
@@ -184,6 +198,9 @@ class ExperimentRunner:
             active_remaining_seconds=remaining,
             recovery_remaining_seconds=recovery_remaining,
             runner_active=self._runner_task is not None and not self._runner_task.done(),
+            stream_receiving=stream_receiving,
+            stream_outage_seconds=stream_outage,
+            stream_fatal_outage_seconds=self.config.fatal_outage_seconds,
         )
 
     async def initialize(self) -> RunRecord:
@@ -199,7 +216,7 @@ class ExperimentRunner:
                     outcome="interrupted",
                 )
             if state in ACTIVE_STATES:
-                self._begin_active_locked(resumed=True)
+                self._begin_active_locked(resumed=True, account_closed_outage=True)
             elif state in {ExperimentState.RECOVERY, ExperimentState.STOPPED_LOW_BATTERY}:
                 self._begin_recovery_phase_locked(resumed=True)
             if state in RESUMABLE_STATES:
@@ -327,6 +344,7 @@ class ExperimentRunner:
             self._active_anchor = None
             self._last_battery = None
             self._outage_started = None
+            self._reset_stream_tracking_locked()
             self._begin_active_locked(resumed=False)
             self._record_measurement_locked()
             self._start_runner_locked()
@@ -514,46 +532,67 @@ class ExperimentRunner:
             self._note_success_locked()
 
     async def _run_stream(self, generation: int) -> None:
-        reconnect_delay = 2.0
         next_battery = self.clock.monotonic()
         next_checkpoint = self.clock.monotonic() + self.config.stream_checkpoint_seconds
         next_measurement = self.clock.monotonic() + self.config.measurement_interval_seconds
-        stream_task: asyncio.Task[None] | None = None
         stop_event = asyncio.Event()
         self._stream_stop_event = stop_event
+        battery_task: asyncio.Task[BatteryReading] | None = None
 
         def on_bytes(count: int) -> None:
             if count > 0 and generation == self._generation:
-                self._pending_stream_bytes += int(count)
+                self._note_stream_bytes(count)
 
         def on_reconnect() -> None:
             if generation == self._generation:
                 self._pending_stream_reconnects += 1
 
+        def on_error(category: str, message: str) -> None:
+            if generation == self._generation:
+                self._note_stream_error(category, message)
+
+        stream_task = asyncio.create_task(
+            self.backend.run_stream(on_bytes, stop_event, on_reconnect, on_error)
+        )
         try:
             while generation == self._generation:
+                now_mono = self.clock.monotonic()
+                self._refresh_stream_outage(now_mono)
+                async with self._lock:
+                    if generation != self._generation:
+                        return
+                    self._flush_stream_errors_locked()
+                    if self._stream_outage_is_fatal(now_mono):
+                        outage = self._stream_outage_duration(now_mono) or 0.0
+                        message = (
+                            "Continuous stream outage exceeded "
+                            f"{self.config.fatal_outage_seconds:g}s "
+                            f"({outage:.1f}s without stream data)"
+                        )
+                        stop_event.set()
+                        stream_task.cancel()
+                        self._transition_error_locked(message)
+                        return
                 if self._elapsed_active() >= self.config.test_duration(
                     self._run.current_test_number
                 ):
                     stop_event.set()
-                    if stream_task is not None:
-                        stream_task.cancel()
+                    stream_task.cancel()
                     async with self._lock:
                         if generation == self._generation:
                             self._flush_stream_bytes_locked()
                             self._finish_active_locked()
                     return
-                if stream_task is None:
-                    stop_event.clear()
-                    stream_task = asyncio.create_task(
-                        self.backend.run_stream(on_bytes, stop_event, on_reconnect)
-                    )
-                now_mono = self.clock.monotonic()
-                if now_mono >= next_battery:
-                    if await self._poll_battery(generation):
+                if battery_task is not None and battery_task.done():
+                    if await self._consume_stream_battery_task(battery_task, generation):
                         stop_event.set()
                         stream_task.cancel()
                         return
+                    battery_task = None
+                if battery_task is None and now_mono >= next_battery:
+                    battery_task = asyncio.create_task(
+                        self.backend.read_battery(), name="stream-battery-poll"
+                    )
                     next_battery = self._advance_deadline(
                         next_battery, self.config.battery_poll_interval_seconds
                     )
@@ -589,26 +628,73 @@ class ExperimentRunner:
                             now=self.clock.now(),
                         )
                         self._record_event_locked("warning", "stream", message)
-                        if self._note_failure_locked(message):
+                        if not self._run.stream_outage_active:
+                            self._start_stream_outage(self.clock.monotonic())
+                        if self._stream_outage_is_fatal():
+                            self._transition_error_locked(
+                                "Continuous stream outage exceeded "
+                                f"{self.config.fatal_outage_seconds:g}s: {message}"
+                            )
                             return
-                    stream_task = None
-                    await self.clock.sleep(reconnect_delay)
-                    reconnect_delay = min(reconnect_delay * 2, 60.0)
-                    continue
+                    # A backend that exits cannot provide a valid continuous stream.
+                    # Restart it immediately; the explicit outage clock remains intact.
+                    stream_task = asyncio.create_task(
+                        self.backend.run_stream(on_bytes, stop_event, on_reconnect, on_error)
+                    )
                 await self.clock.sleep(
                     min(
                         0.25,
-                        max(0.0, next_battery - self.clock.monotonic()),
+                        (
+                            max(0.0, next_battery - self.clock.monotonic())
+                            if battery_task is None
+                            else 0.25
+                        ),
                         max(0.0, next_checkpoint - self.clock.monotonic()),
                         max(0.0, next_measurement - self.clock.monotonic()),
                     )
                 )
         finally:
             stop_event.set()
-            if stream_task is not None and not stream_task.done():
+            if not stream_task.done():
                 stream_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await stream_task
+            with suppress(asyncio.CancelledError, Exception):
+                await stream_task
+            if battery_task is not None:
+                if not battery_task.done():
+                    battery_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await battery_task
+
+    async def _consume_stream_battery_task(
+        self, task: asyncio.Task[BatteryReading], generation: int
+    ) -> bool:
+        """Apply a completed stream battery poll without blocking liveness checks."""
+
+        try:
+            reading = task.result()
+        except asyncio.CancelledError:
+            return True
+        except Exception as exc:
+            async with self._lock:
+                if generation != self._generation:
+                    return True
+                self._run = self.storage.update_run(
+                    self._run.id, latest_error=str(exc), now=self.clock.now()
+                )
+                self._record_event_locked("warning", "battery", f"Battery refresh failed: {exc}")
+                fatal = self._note_failure_locked(str(exc))
+                self._record_measurement_locked()
+                return fatal
+        async with self._lock:
+            if generation != self._generation:
+                return True
+            self._last_battery = reading
+            self._note_success_locked()
+            if self._is_low(reading) and ExperimentState(self._run.state) in ACTIVE_STATES:
+                self._transition_low_battery_locked(reading)
+                return True
+            self._record_measurement_locked()
+            return False
 
     async def _poll_battery(self, generation: int) -> bool:
         try:
@@ -684,16 +770,21 @@ class ExperimentRunner:
                 min(until_poll, until_deadline) if until_deadline else until_poll
             )
 
-    def _begin_active_locked(self, *, resumed: bool) -> None:
+    def _begin_active_locked(self, *, resumed: bool, account_closed_outage: bool = False) -> None:
         now = self.clock.now()
-        self._active_anchor = self.clock.monotonic()
+        test = self.config.test(self._run.current_test_number)
+        if test.kind == "stream":
+            self._reset_stream_tracking_locked()
+            self._restore_or_start_stream_outage_locked(account_closed=account_closed_outage)
+            self._active_anchor = None
+        else:
+            self._active_anchor = self.clock.monotonic()
         self._run = self.storage.update_run(
             self._run.id,
             phase_started_at_utc=now,
             phase_deadline_at_utc=None,
             now=now,
         )
-        test = self.config.test(self._run.current_test_number)
         self._phase_id = self.storage.begin_phase(
             self._run.id,
             phase_kind=test.kind,
@@ -844,6 +935,17 @@ class ExperimentRunner:
         self._record_measurement_locked()
 
     def _checkpoint_active_locked(self) -> None:
+        if ExperimentState(self._run.state) == ExperimentState.RUNNING_STREAM:
+            elapsed = self._run.active_elapsed_seconds + self._pending_stream_valid_seconds
+            self._pending_stream_valid_seconds = 0.0
+            self._flush_stream_bytes_locked()
+            self._checkpoint_stream_outage_locked()
+            self._run = self.storage.update_run(
+                self._run.id,
+                active_elapsed_seconds=elapsed,
+                now=self.clock.now(),
+            )
+            return
         if self._active_anchor is None:
             return
         now_mono = self.clock.monotonic()
@@ -915,6 +1017,159 @@ class ExperimentRunner:
     def _note_success_locked(self) -> None:
         self._outage_started = None
 
+    def _reset_stream_tracking_locked(self) -> None:
+        self._stream_outage_started = None
+        self._last_stream_bytes_at = None
+        self._pending_stream_valid_seconds = 0.0
+        self._pending_stream_errors.clear()
+
+    def _restore_or_start_stream_outage_locked(self, *, account_closed: bool) -> None:
+        """Restore a durable outage, optionally including crash downtime."""
+
+        now_utc = self.clock.now()
+        seconds = self._run.stream_outage_seconds
+        if self._run.stream_outage_active:
+            checkpoint = self._run.stream_outage_checkpoint_at_utc
+            if account_closed and checkpoint is not None:
+                seconds += max(0.0, (now_utc - checkpoint).total_seconds())
+        else:
+            seconds = 0.0
+        self._stream_outage_started = self.clock.monotonic()
+        self._run = self.storage.update_run(
+            self._run.id,
+            stream_outage_seconds=seconds,
+            stream_outage_active=True,
+            stream_outage_checkpoint_at_utc=now_utc,
+            now=now_utc,
+        )
+
+    def _start_stream_outage(self, started_at: float) -> None:
+        """Persist the transition into outage before relying on periodic checkpoints."""
+
+        if self._run.stream_outage_active:
+            return
+        now_mono = self.clock.monotonic()
+        now_utc = self.clock.now()
+        seconds = max(0.0, now_mono - started_at)
+        self._stream_outage_started = now_mono
+        self._run = self.storage.update_run(
+            self._run.id,
+            stream_outage_seconds=seconds,
+            stream_outage_active=True,
+            stream_outage_checkpoint_at_utc=now_utc,
+            now=now_utc,
+        )
+
+    def _checkpoint_stream_outage_locked(self) -> None:
+        if not self._run.stream_outage_active or self._stream_outage_started is None:
+            return
+        now_mono = self.clock.monotonic()
+        now_utc = self.clock.now()
+        seconds = self._run.stream_outage_seconds + max(0.0, now_mono - self._stream_outage_started)
+        self._stream_outage_started = now_mono
+        self._run = self.storage.update_run(
+            self._run.id,
+            stream_outage_seconds=seconds,
+            stream_outage_active=True,
+            stream_outage_checkpoint_at_utc=now_utc,
+            now=now_utc,
+        )
+
+    def _clear_stream_outage_on_receipt(self) -> None:
+        if not self._run.stream_outage_active and self._stream_outage_started is None:
+            return
+        self._stream_outage_started = None
+        self._run = self.storage.update_run(
+            self._run.id,
+            stream_outage_seconds=0.0,
+            stream_outage_active=False,
+            stream_outage_checkpoint_at_utc=None,
+            now=self.clock.now(),
+        )
+
+    def _note_stream_bytes(self, count: int) -> None:
+        """Count bytes and only the proven-good interval between nearby receipts."""
+
+        if count <= 0:
+            return
+        now = self.clock.monotonic()
+        if self._last_stream_bytes_at is not None:
+            gap = max(0.0, now - self._last_stream_bytes_at)
+            if (
+                not self._run.stream_outage_active
+                and gap <= self.config.stream_data_timeout_seconds
+            ):
+                self._pending_stream_valid_seconds += gap
+        self._last_stream_bytes_at = now
+        self._clear_stream_outage_on_receipt()
+        self._pending_stream_bytes += int(count)
+
+    def _note_stream_error(self, category: str, message: str) -> None:
+        """Make an internal consumer failure visible without waiting for task exit."""
+
+        now = self.clock.monotonic()
+        if not self._run.stream_outage_active:
+            started_at = (
+                self._last_stream_bytes_at if self._last_stream_bytes_at is not None else now
+            )
+            self._start_stream_outage(started_at)
+        self._pending_stream_errors.append((category, message))
+
+    def _stream_is_receiving(self, now: float | None = None) -> bool:
+        if ExperimentState(self._run.state) != ExperimentState.RUNNING_STREAM:
+            return False
+        if self._last_stream_bytes_at is None:
+            return False
+        current = self.clock.monotonic() if now is None else now
+        return (
+            max(0.0, current - self._last_stream_bytes_at)
+            <= self.config.stream_data_timeout_seconds
+            and not self._run.stream_outage_active
+        )
+
+    def _refresh_stream_outage(self, now: float | None = None) -> None:
+        current = self.clock.monotonic() if now is None else now
+        if self._last_stream_bytes_at is None:
+            if not self._run.stream_outage_active:
+                self._start_stream_outage(current)
+            return
+        if current - self._last_stream_bytes_at > self.config.stream_data_timeout_seconds:
+            if not self._run.stream_outage_active:
+                # The whole interval since the last positive receipt is unavailable;
+                # the inactivity timeout is only the detector, not valid stream time.
+                self._start_stream_outage(self._last_stream_bytes_at)
+
+    def _stream_outage_duration(self, now: float | None = None) -> float | None:
+        if ExperimentState(self._run.state) != ExperimentState.RUNNING_STREAM:
+            return None
+        current = self.clock.monotonic() if now is None else now
+        self._refresh_stream_outage(current)
+        if not self._run.stream_outage_active:
+            return 0.0
+        pending = (
+            max(0.0, current - self._stream_outage_started)
+            if self._stream_outage_started is not None
+            else 0.0
+        )
+        return self._run.stream_outage_seconds + pending
+
+    def _stream_outage_is_fatal(self, now: float | None = None) -> bool:
+        duration = self._stream_outage_duration(now)
+        return duration is not None and duration >= self.config.fatal_outage_seconds
+
+    def _flush_stream_errors_locked(self) -> None:
+        if not self._pending_stream_errors:
+            return
+        for category, message in self._pending_stream_errors:
+            description = f"{category.replace('_', ' ').title()}: {message}"
+            self._run = self.storage.update_run(
+                self._run.id,
+                latest_error=description,
+                now=self.clock.now(),
+            )
+            self._record_event_locked("warning", category, message)
+        self._pending_stream_errors.clear()
+
     def _note_failure_locked(self, message: str) -> bool:
         now = self.clock.monotonic()
         if self._outage_started is None:
@@ -938,6 +1193,8 @@ class ExperimentRunner:
         )
 
     def _elapsed_active(self) -> float:
+        if ExperimentState(self._run.state) == ExperimentState.RUNNING_STREAM:
+            return self._run.active_elapsed_seconds + self._pending_stream_valid_seconds
         if self._active_anchor is None:
             return self._run.active_elapsed_seconds
         return self._run.active_elapsed_seconds + max(

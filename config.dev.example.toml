@@ -5,6 +5,7 @@ recovery_duration_seconds = 20
 battery_poll_seconds = 5
 measurement_interval_seconds = 5
 stream_checkpoint_seconds = 2
+stream_data_timeout_seconds = 5
 fatal_outage_seconds = 30
 development_mode = true
 

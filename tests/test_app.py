@@ -11,6 +11,7 @@ import pytest
 
 from blink_dashboard.app import ACCESS_COOKIE, DashboardApplication, create_web_app
 from blink_dashboard.config import load_config
+from blink_dashboard.experiment import ExperimentState
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -112,6 +113,12 @@ async def test_health_index_and_canonical_status(dashboard):
     }
     assert payload["adapter"]["camera"]["name"] == "Front Door"
     assert payload["controls"]["start"] is True
+    assert payload["stream"] == {
+        "receiving": False,
+        "outage_seconds": None,
+        "fatal_outage_seconds": 3600.0,
+        "data_timeout_seconds": 20.0,
+    }
     assert response.headers["Cache-Control"] == "no-store"
 
 
@@ -128,6 +135,28 @@ async def test_control_transition_and_invalid_continue_are_structured(dashboard)
     stopped = await http.post("/api/experiment/stop", json={})
     assert stopped.status == 202
     assert (await stopped.json())["run"]["state"] == "stopped_manual"
+
+
+async def test_status_exposes_live_stream_receipt_and_outage_contract(dashboard):
+    http, services = dashboard
+    runner = services.experiment
+    runner._run = services.storage.update_run(
+        runner.current_run.id,
+        state=ExperimentState.RUNNING_STREAM.value,
+        current_test_number=4,
+    )
+    runner._begin_active_locked(resumed=False)
+
+    waiting = await (await http.get("/api/status")).json()
+    assert waiting["stream"]["receiving"] is False
+    assert waiting["stream"]["outage_seconds"] >= 0
+    assert waiting["stream"]["fatal_outage_seconds"] == 3600
+    assert waiting["stream"]["data_timeout_seconds"] == 20
+
+    runner._note_stream_bytes(188)
+    receiving = await (await http.get("/api/status")).json()
+    assert receiving["stream"]["receiving"] is True
+    assert receiving["stream"]["outage_seconds"] == 0
 
 
 async def test_measurements_errors_and_missing_media_contracts(dashboard):

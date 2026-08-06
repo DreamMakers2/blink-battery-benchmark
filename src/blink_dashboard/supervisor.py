@@ -75,14 +75,21 @@ async def wait_for_adapter(
     base_url: str,
     process: asyncio.subprocess.Process,
     *,
-    timeout_seconds: float = 300,
+    timeout_seconds: float | None = None,
+    poll_interval_seconds: float = 0.4,
 ) -> dict[str, object]:
-    """Wait for the interactive adapter to authenticate and expose its API."""
+    """Wait for the interactive or retrying adapter to expose its API.
 
-    deadline = time.monotonic() + timeout_seconds
+    The production default has no wall-clock deadline: a running adapter may be
+    waiting for a user MFA response or retrying a temporary Blink outage.  A
+    finite timeout remains injectable for tests and explicit callers.  Child
+    exit and task cancellation still end the wait immediately.
+    """
+
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
     timeout = aiohttp.ClientTimeout(total=2)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        while time.monotonic() < deadline:
+        while deadline is None or time.monotonic() < deadline:
             return_code = process.returncode
             if return_code is not None:
                 raise StartupError(f"Blink adapter exited during setup (code {return_code}).")
@@ -93,11 +100,8 @@ async def wait_for_adapter(
                         return payload
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
                 pass
-            await asyncio.sleep(0.4)
-    raise StartupError(
-        "Blink setup did not finish within five minutes. Complete any credential or MFA "
-        "prompt in this window and launch again."
-    )
+            await asyncio.sleep(poll_interval_seconds)
+    raise StartupError(f"Blink setup did not finish within {timeout_seconds:g} seconds.")
 
 
 async def start_adapter(project_root: Path, config: AppConfig) -> asyncio.subprocess.Process:

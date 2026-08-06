@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
+
 from aiohttp import web
 import pytest
 
+import blink_dashboard.supervisor as supervisor
 from blink_dashboard.supervisor import (
     StartupError,
     dashboard_is_running,
@@ -19,11 +23,12 @@ class FakeProcess:
 async def local_server():
     runners: list[web.AppRunner] = []
 
-    async def start(payload: dict[str, object], status: int = 200) -> str:
+    async def start(payload, status: int = 200) -> str:
         app = web.Application()
 
         async def health(_request: web.Request) -> web.Response:
-            return web.json_response(payload, status=status)
+            current_payload = payload() if callable(payload) else payload
+            return web.json_response(current_payload, status=status)
 
         app.router.add_get("/healthz", health)
         app.router.add_get("/", health)
@@ -61,6 +66,43 @@ async def test_wait_for_adapter_reports_early_exit():
     process.returncode = 7
     with pytest.raises(StartupError, match="code 7"):
         await wait_for_adapter("http://127.0.0.1:9", process, timeout_seconds=1)
+
+
+async def test_wait_for_adapter_has_no_production_wall_clock_cutoff(local_server, monkeypatch):
+    calls = 0
+
+    def delayed_readiness():
+        nonlocal calls
+        calls += 1
+        if calls < 4:
+            return {"status": "starting", "authentication_ready": False}
+        return {"status": "ok", "authentication_ready": True}
+
+    url = await local_server(delayed_readiness)
+    monkeypatch.setattr(
+        supervisor,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: pytest.fail(
+                "default adapter wait must not consult a startup deadline"
+            )
+        ),
+    )
+
+    result = await wait_for_adapter(url, FakeProcess(), poll_interval_seconds=0)
+
+    assert result["authentication_ready"] is True
+    assert calls == 4
+
+
+async def test_wait_for_adapter_remains_cancelable(local_server):
+    url = await local_server({"status": "starting", "authentication_ready": False})
+    task = asyncio.create_task(wait_for_adapter(url, FakeProcess(), poll_interval_seconds=0.01))
+    await asyncio.sleep(0.03)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 def test_dashboard_access_token_is_project_local_and_stable(tmp_path):

@@ -223,6 +223,38 @@ class FakeApi:
         return False
 
 
+def scripted_blink_type(outcomes, *, mfa_outcomes=()):
+    remaining = list(outcomes)
+    remaining_mfa = list(mfa_outcomes)
+
+    class ScriptedBlink:
+        instances = []
+
+        def __init__(self, session):
+            self.auth = None
+            self.available = False
+            self.camera = FakeCamera()
+            self.cameras = OrderedDict([(self.camera.name, self.camera)])
+            self.instances.append(self)
+
+        async def start(self):
+            outcome = remaining.pop(0)
+            if callable(outcome):
+                outcome = outcome(self)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            self.available = outcome is True
+            return outcome
+
+        async def send_2fa_code(self, _code):
+            outcome = remaining_mfa.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+    return ScriptedBlink
+
+
 async def test_first_authentication_and_token_callback_save_encrypted_payload_shape() -> None:
     store = MemoryStore()
     answers = iter(["person@example.test"])
@@ -248,25 +280,191 @@ async def test_first_authentication_and_token_callback_save_encrypted_payload_sh
     assert store.payload["selected_camera"]["serial"] == "SERIAL-7"
 
 
-async def test_rejected_saved_session_prompts_for_new_credentials() -> None:
+async def test_saved_session_false_result_retries_without_credential_prompt() -> None:
     store = MemoryStore(
         {
             "auth": {"username": "expired@example.test", "password": "old"},
             "selected_camera": None,
         }
     )
-    answers = iter(["new@example.test"])
+    Blink = scripted_blink_type([False, True])
+    delays = []
+
+    result = await authenticate_blink(
+        store,
+        object(),
+        input_fn=lambda prompt: pytest.fail(f"unexpected prompt: {prompt}"),
+        password_fn=lambda prompt: pytest.fail(f"unexpected password prompt: {prompt}"),
+        blink_types=(Blink, FakeAuth, FakeTwoFactorRequired, FakeApi()),
+        retry_sleep=lambda delay: _record_delay(delays, delay),
+        retry_initial_seconds=1,
+        retry_max_seconds=4,
+    )
+
+    assert result.blink is Blink.instances[1]
+    assert delays == [1]
+    assert [instance.auth.data["username"] for instance in Blink.instances] == [
+        "expired@example.test",
+        "expired@example.test",
+    ]
+
+
+async def _record_delay(delays, delay):
+    delays.append(delay)
+
+
+async def test_saved_session_exception_retries_with_capped_exponential_backoff() -> None:
+    store = MemoryStore({"auth": {"token": "saved"}, "selected_camera": None})
+    Blink = scripted_blink_type(
+        [
+            ConnectionError("temporary outage"),
+            False,
+            RuntimeError("BlinkTwoFARequiredError: MFA required"),
+            True,
+        ]
+    )
+    delays = []
 
     await authenticate_blink(
         store,
         object(),
-        input_fn=lambda _prompt: next(answers),
-        password_fn=lambda _prompt: "new-password",
-        blink_types=(FakeAuthenticatingBlink, FakeAuth, FakeTwoFactorRequired, FakeApi()),
+        input_fn=lambda prompt: pytest.fail(f"unexpected prompt: {prompt}"),
+        password_fn=lambda prompt: pytest.fail(f"unexpected password prompt: {prompt}"),
+        blink_types=(Blink, FakeAuth, FakeTwoFactorRequired, FakeApi()),
+        retry_sleep=lambda delay: _record_delay(delays, delay),
+        retry_initial_seconds=2,
+        retry_max_seconds=5,
+        retry_backoff_factor=2,
     )
 
-    assert store.payload["auth"]["username"] == "new@example.test"
-    assert store.payload["auth"]["password"] == "new-password"
+    assert delays == [2, 4, 5]
+    assert len(Blink.instances) == 4
+
+
+async def test_saved_session_retry_preserves_store_and_propagates_cancellation() -> None:
+    original = {"auth": {"username": "saved@example.test"}, "selected_camera": None}
+    store = MemoryStore(original.copy())
+    Blink = scripted_blink_type([False])
+
+    async def cancel_retry(_delay):
+        assert store.payload == original
+        assert store.saved == []
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await authenticate_blink(
+            store,
+            object(),
+            input_fn=lambda prompt: pytest.fail(f"unexpected prompt: {prompt}"),
+            password_fn=lambda prompt: pytest.fail(f"unexpected password prompt: {prompt}"),
+            blink_types=(Blink, FakeAuth, FakeTwoFactorRequired, FakeApi()),
+            retry_sleep=cancel_retry,
+            retry_initial_seconds=0,
+            retry_max_seconds=0,
+        )
+
+    assert store.payload == original
+    assert store.saved == []
+
+
+async def test_saved_session_retry_reloads_rotated_encrypted_payload() -> None:
+    store = MemoryStore({"auth": {"token": "old-token"}, "selected_camera": None})
+
+    def rotate_from_callback(candidate):
+        assert candidate.auth.data["token"] == "old-token"
+        candidate.auth.data["token"] = "rotated-token"
+        candidate.auth.data["hardware_id"] = "rotated-device"
+        candidate.auth.callback()
+        return False
+
+    Blink = scripted_blink_type([rotate_from_callback, True])
+
+    await authenticate_blink(
+        store,
+        object(),
+        input_fn=lambda prompt: pytest.fail(f"unexpected prompt: {prompt}"),
+        password_fn=lambda prompt: pytest.fail(f"unexpected password prompt: {prompt}"),
+        blink_types=(Blink, FakeAuth, FakeTwoFactorRequired, FakeApi()),
+        retry_sleep=lambda delay: _record_delay([], delay),
+        retry_initial_seconds=0,
+        retry_max_seconds=0,
+    )
+
+    assert Blink.instances[1].auth.data["token"] == "rotated-token"
+    assert Blink.instances[1].auth.data["hardware_id"] == "rotated-device"
+
+
+async def test_only_exact_two_factor_exception_prompts_for_mfa() -> None:
+    class LookalikeTwoFactorRequired(FakeTwoFactorRequired):
+        pass
+
+    store = MemoryStore({"auth": {"token": "saved"}, "selected_camera": None})
+    Blink = scripted_blink_type([LookalikeTwoFactorRequired("MFA required"), True])
+
+    await authenticate_blink(
+        store,
+        object(),
+        input_fn=lambda prompt: pytest.fail(f"lookalike exception prompted: {prompt}"),
+        password_fn=lambda prompt: pytest.fail(f"unexpected password prompt: {prompt}"),
+        blink_types=(Blink, FakeAuth, FakeTwoFactorRequired, FakeApi()),
+        retry_sleep=lambda delay: _record_delay([], delay),
+        retry_initial_seconds=0,
+        retry_max_seconds=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "mfa_outcome",
+    [False, ConnectionError("temporary MFA service outage")],
+    ids=["unconfirmed", "exception"],
+)
+async def test_explicit_mfa_transient_failure_retains_saved_auth_and_retries(
+    mfa_outcome,
+) -> None:
+    original = {"auth": {"token": "saved-token"}, "selected_camera": None}
+    store = MemoryStore(original.copy())
+    Blink = scripted_blink_type([FakeTwoFactorRequired(), True], mfa_outcomes=[mfa_outcome])
+    prompts = []
+    delays = []
+
+    result = await authenticate_blink(
+        store,
+        object(),
+        input_fn=lambda prompt: prompts.append(prompt) or "123456",
+        password_fn=lambda prompt: pytest.fail(f"unexpected password prompt: {prompt}"),
+        blink_types=(Blink, FakeAuth, FakeTwoFactorRequired, FakeApi()),
+        retry_sleep=lambda delay: _record_delay(delays, delay),
+        retry_initial_seconds=3,
+        retry_max_seconds=10,
+    )
+
+    assert result.blink is Blink.instances[1]
+    assert prompts == ["Enter the Blink MFA code: "]
+    assert delays == [3]
+    assert Blink.instances[1].auth.data["token"] == "saved-token"
+    assert all("123456" not in repr(payload) for payload in store.saved)
+
+
+async def test_saved_session_start_cancellation_propagates_without_retry() -> None:
+    store = MemoryStore({"auth": {"token": "saved"}, "selected_camera": None})
+    Blink = scripted_blink_type([asyncio.CancelledError()])
+    sleep_called = False
+
+    async def unexpected_sleep(_delay):
+        nonlocal sleep_called
+        sleep_called = True
+
+    with pytest.raises(asyncio.CancelledError):
+        await authenticate_blink(
+            store,
+            object(),
+            input_fn=lambda prompt: pytest.fail(f"unexpected prompt: {prompt}"),
+            password_fn=lambda prompt: pytest.fail(f"unexpected password prompt: {prompt}"),
+            blink_types=(Blink, FakeAuth, FakeTwoFactorRequired, FakeApi()),
+            retry_sleep=unexpected_sleep,
+        )
+
+    assert sleep_called is False
 
 
 async def test_mfa_compatibility_request_marks_device_remembered() -> None:

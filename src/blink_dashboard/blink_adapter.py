@@ -8,7 +8,7 @@ tests, database tooling, and the dashboard itself independent of Blink hardware.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import importlib
@@ -231,8 +231,21 @@ async def authenticate_blink(
     input_fn: Callable[[str], str] = input,
     password_fn: Callable[[str], str] | None = None,
     blink_types: tuple[type[Any], type[Any], type[BaseException], Any] | None = None,
+    retry_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    retry_initial_seconds: float = 2.0,
+    retry_max_seconds: float = 60.0,
+    retry_backoff_factor: float = 2.0,
 ) -> AuthenticationResult:
-    """Authenticate, handle MFA, select a camera, and persist every token update."""
+    """Authenticate, handle MFA, select a camera, and persist every token update.
+
+    Once an encrypted saved session exists, startup failures are deliberately
+    treated as ambiguous.  Blinkpy reports both rejected sessions and temporary
+    service/network failures through ``False`` results and broad exceptions, so
+    discarding the session or asking for the password would be unsafe.  Instead,
+    each retry reloads the latest encrypted payload and creates a fresh Blink
+    candidate.  Only Blinkpy's explicit two-factor exception may open an MFA
+    prompt.
+    """
 
     if password_fn is None:
         from getpass import getpass
@@ -240,6 +253,11 @@ async def authenticate_blink(
         password_fn = getpass
 
     Blink, Auth, BlinkTwoFARequiredError, api = blink_types or _load_blinkpy()
+    if retry_initial_seconds < 0 or retry_max_seconds < 0:
+        raise ValueError("Blink authentication retry delays cannot be negative")
+    if retry_backoff_factor < 1:
+        raise ValueError("Blink authentication retry backoff must be at least 1")
+
     saved_payload = store.load() or {}
     saved_auth = saved_payload.get("auth")
     saved_camera = saved_payload.get("selected_camera")
@@ -256,24 +274,82 @@ async def authenticate_blink(
         blink.auth = Auth(dict(auth_data), no_prompt=True, session=session, callback=token_callback)
         return blink
 
-    async def start(candidate: Any) -> bool:
+    async def start(candidate: Any, *, retry_saved_auth: bool) -> bool:
         try:
             started = await candidate.start()
-        except BlinkTwoFARequiredError:
+        except BlinkTwoFARequiredError as exc:
+            # Do not infer MFA from exception text or related exception classes.
+            # Blinkpy's exact sentinel is the only authority for prompting.
+            if type(exc) is not BlinkTwoFARequiredError:
+                if retry_saved_auth:
+                    LOGGER.warning(
+                        "Saved Blink authentication startup failed (%s); retrying.",
+                        type(exc).__name__,
+                    )
+                    return False
+                raise AuthenticationFailed("Blink authentication could not be completed.") from exc
             print("Blink requires multi-factor authentication.")
             code = input_fn("Enter the Blink MFA code: ").strip()
-            if not code or not await _complete_2fa(candidate, api, code):
+            try:
+                completed = bool(code) and await _complete_2fa(candidate, api, code)
+            except asyncio.CancelledError:
+                raise
+            except Exception as mfa_exc:
+                if retry_saved_auth:
+                    LOGGER.warning(
+                        "Saved Blink MFA completion failed (%s); retrying authentication.",
+                        type(mfa_exc).__name__,
+                    )
+                    return False
+                raise AuthenticationFailed("Blink MFA verification failed.") from mfa_exc
+            if not completed:
+                if retry_saved_auth:
+                    LOGGER.warning(
+                        "Saved Blink MFA completion was not confirmed; retrying authentication."
+                    )
+                    return False
                 raise AuthenticationFailed("Blink MFA verification failed.")
             started = True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if retry_saved_auth:
+                LOGGER.warning(
+                    "Saved Blink authentication startup failed (%s); retrying.",
+                    type(exc).__name__,
+                )
+                return False
+            raise AuthenticationFailed("Blink authentication could not be completed.") from exc
         return started is True
 
     blink = None
     if isinstance(saved_auth, Mapping):
-        candidate = make_blink(saved_auth)
-        if await start(candidate):
-            blink = candidate
-        else:
-            LOGGER.warning("Saved Blink authentication was rejected; requesting credentials.")
+        # Retain an in-memory last-known copy in case an external writer briefly
+        # makes the store unavailable, but reload the encrypted store before
+        # every attempt so token callbacks/other processes can rotate the state.
+        last_saved_auth = dict(saved_auth)
+        retry_delay = min(retry_initial_seconds, retry_max_seconds)
+        while blink is None:
+            latest_payload = store.load() or {}
+            latest_auth = latest_payload.get("auth")
+            latest_camera = latest_payload.get("selected_camera")
+            if isinstance(latest_auth, Mapping):
+                last_saved_auth = dict(latest_auth)
+            if isinstance(latest_camera, Mapping):
+                saved_camera = latest_camera
+                camera_state["value"] = dict(latest_camera)
+
+            candidate = make_blink(last_saved_auth)
+            if await start(candidate, retry_saved_auth=True):
+                blink = candidate
+                break
+
+            LOGGER.warning(
+                "Blink saved-session startup remains unavailable; retrying in %.1f seconds.",
+                retry_delay,
+            )
+            await retry_sleep(retry_delay)
+            retry_delay = min(retry_max_seconds, retry_delay * retry_backoff_factor)
 
     if blink is None:
         username = input_fn("Blink username (email): ").strip()
@@ -285,7 +361,7 @@ async def authenticate_blink(
         for handler in logging.getLogger().handlers:
             handler.addFilter(redactor)
         candidate = make_blink({"username": username, "password": password})
-        if not await start(candidate):
+        if not await start(candidate, retry_saved_auth=False):
             raise AuthenticationFailed("Blink authentication failed.")
         blink = candidate
 

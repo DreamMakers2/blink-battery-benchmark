@@ -44,6 +44,91 @@ def test_hls_readiness_requires_recent_stream_data(tmp_path) -> None:
     assert not consumer.is_fresh()
 
 
+def test_hls_consumer_requires_positive_read_timeout(tmp_path) -> None:
+    with pytest.raises(ValueError, match="read_timeout must be greater than zero"):
+        HlsStreamConsumer(host="127.0.0.1", port=5000, hls_dir=tmp_path, read_timeout=0)
+
+
+async def test_hls_consumer_reports_initial_ffmpeg_start_failure(monkeypatch, tmp_path) -> None:
+    consumer = HlsStreamConsumer(
+        host="127.0.0.1", port=5000, hls_dir=tmp_path, reconnect_delay=0.001
+    )
+    stop_event = asyncio.Event()
+    errors = []
+
+    async def fail_start():
+        raise FileNotFoundError("ffmpeg missing")
+
+    def on_error(category, message):
+        errors.append((category, message))
+        stop_event.set()
+
+    monkeypatch.setattr(consumer, "_start_ffmpeg", fail_start)
+    await asyncio.wait_for(
+        consumer.run(stop_event, on_error=on_error),
+        timeout=1,
+    )
+
+    assert errors == [("ffmpeg_failure", "ffmpeg missing")]
+
+
+async def test_hls_consumer_reports_silent_stream_inactivity(monkeypatch, tmp_path) -> None:
+    class FakeStdin:
+        def close(self):
+            return None
+
+        async def wait_closed(self):
+            return None
+
+    class FakeProcess:
+        returncode = None
+        stdin = FakeStdin()
+        stderr = None
+
+        async def wait(self):
+            return 0
+
+    class SilentReader:
+        async def read(self, _size):
+            await asyncio.Event().wait()
+
+    class FakeWriter:
+        def close(self):
+            return None
+
+        async def wait_closed(self):
+            return None
+
+    consumer = HlsStreamConsumer(
+        host="127.0.0.1",
+        port=5000,
+        hls_dir=tmp_path,
+        read_timeout=0.001,
+        reconnect_delay=0.001,
+    )
+    stop_event = asyncio.Event()
+    errors = []
+
+    async def start_ffmpeg():
+        consumer.process = FakeProcess()
+
+    async def open_connection(_host, _port):
+        return SilentReader(), FakeWriter()
+
+    def on_error(category, message):
+        errors.append((category, message))
+        stop_event.set()
+
+    monkeypatch.setattr(consumer, "_start_ffmpeg", start_ffmpeg)
+    monkeypatch.setattr(asyncio, "open_connection", open_connection)
+    await asyncio.wait_for(
+        consumer.run(stop_event, on_error=on_error),
+        timeout=1,
+    )
+
+    assert errors == [("stream_inactivity", "No stream data received for 0.001 seconds")]
+
+
 async def test_hls_consumer_restarts_exited_ffmpeg(monkeypatch, tmp_path) -> None:
     class FakeStdin:
         def write(self, _chunk):

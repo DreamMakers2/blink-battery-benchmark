@@ -111,6 +111,8 @@ def test_dashboard_contains_required_views_and_accessible_labels() -> None:
         "snapshot-image",
         "snapshot-timeouts",
         "stream-video",
+        "stream-receiving",
+        "stream-outage",
         "battery-chart",
         "accessible-history",
         "history-summary",
@@ -169,6 +171,20 @@ def test_frontend_uses_safe_updates_and_mutating_posts() -> None:
         assert endpoint in JS
     for endpoint in ("start", "stop", "restart", "continue"):
         assert f'"/api/experiment/{endpoint}"' in JS
+    assert "stream.outage_seconds" in JS
+    assert "stream.fatal_outage_seconds" in JS
+    assert 'dom.streamReceiving.textContent = stream.receiving ? "Receiving" : "No data"' in JS
+    assert (
+        'role="status" aria-live="polite" aria-atomic="true" '
+        'aria-label="Stream reception status"' in HTML
+    )
+    assert "renderStreamHealthUnavailable();" in JS
+    assert 'dom.streamReceiving.textContent = "Unknown"' in JS
+    assert 'dom.streamOutage.textContent = "Status unavailable"' in JS
+    assert (
+        'runtime.status.state === "running_snapshot" || runtime.status.state === "recovery"' in JS
+    )
+    assert 'runtime.status.state.startsWith("running_")' not in JS
 
 
 def test_style_uses_reference_mesh_and_responsive_layout() -> None:

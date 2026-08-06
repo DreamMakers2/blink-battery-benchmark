@@ -18,7 +18,7 @@ import threading
 from typing import Any, Iterator, Mapping
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def utc_now() -> datetime:
@@ -55,6 +55,9 @@ class RunRecord:
     snapshot_timeouts: int
     stream_bytes: int
     stream_reconnects: int
+    stream_outage_seconds: float
+    stream_outage_active: bool
+    stream_outage_checkpoint_at_utc: datetime | None
     created_at_utc: datetime
     updated_at_utc: datetime
     completed_at_utc: datetime | None
@@ -108,12 +111,16 @@ _RUN_UPDATE_FIELDS = {
     "snapshot_timeouts",
     "stream_bytes",
     "stream_reconnects",
+    "stream_outage_seconds",
+    "stream_outage_active",
+    "stream_outage_checkpoint_at_utc",
     "completed_at_utc",
 }
 _RUN_DATETIME_FIELDS = {
     "phase_started_at_utc",
     "phase_deadline_at_utc",
     "completed_at_utc",
+    "stream_outage_checkpoint_at_utc",
 }
 
 
@@ -190,6 +197,11 @@ class SQLiteStorage:
                         snapshot_timeouts INTEGER NOT NULL DEFAULT 0,
                         stream_bytes INTEGER NOT NULL DEFAULT 0,
                         stream_reconnects INTEGER NOT NULL DEFAULT 0,
+                        stream_outage_seconds REAL NOT NULL DEFAULT 0
+                            CHECK(stream_outage_seconds >= 0),
+                        stream_outage_active INTEGER NOT NULL DEFAULT 0
+                            CHECK(stream_outage_active IN (0, 1)),
+                        stream_outage_checkpoint_at_utc TEXT,
                         created_at_utc TEXT NOT NULL,
                         updated_at_utc TEXT NOT NULL,
                         completed_at_utc TEXT
@@ -249,7 +261,7 @@ class SQLiteStorage:
                         ON measurements(run_id, observed_at_utc);
                     CREATE INDEX idx_events_run_observed
                         ON events(run_id, observed_at_utc DESC);
-                    PRAGMA user_version = 2;
+                    PRAGMA user_version = 3;
                     COMMIT;
                     """
                     )
@@ -267,6 +279,27 @@ class SQLiteStorage:
                         ALTER TABLE measurements
                             ADD COLUMN snapshot_timeouts INTEGER NOT NULL DEFAULT 0;
                         PRAGMA user_version = 2;
+                        COMMIT;
+                        """
+                    )
+                except BaseException:
+                    self._connection.rollback()
+                    raise
+        if self.schema_version == 2:
+            with self._lock:
+                try:
+                    self._connection.executescript(
+                        """
+                        BEGIN IMMEDIATE;
+                        ALTER TABLE runs
+                            ADD COLUMN stream_outage_seconds REAL NOT NULL DEFAULT 0
+                                CHECK(stream_outage_seconds >= 0);
+                        ALTER TABLE runs
+                            ADD COLUMN stream_outage_active INTEGER NOT NULL DEFAULT 0
+                                CHECK(stream_outage_active IN (0, 1));
+                        ALTER TABLE runs
+                            ADD COLUMN stream_outage_checkpoint_at_utc TEXT;
+                        PRAGMA user_version = 3;
                         COMMIT;
                         """
                     )
@@ -510,6 +543,9 @@ class SQLiteStorage:
             snapshot_timeouts=row["snapshot_timeouts"],
             stream_bytes=row["stream_bytes"],
             stream_reconnects=row["stream_reconnects"],
+            stream_outage_seconds=row["stream_outage_seconds"],
+            stream_outage_active=bool(row["stream_outage_active"]),
+            stream_outage_checkpoint_at_utc=from_timestamp(row["stream_outage_checkpoint_at_utc"]),
             created_at_utc=from_timestamp(row["created_at_utc"]),  # type: ignore[arg-type]
             updated_at_utc=from_timestamp(row["updated_at_utc"]),  # type: ignore[arg-type]
             completed_at_utc=from_timestamp(row["completed_at_utc"]),

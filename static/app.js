@@ -78,7 +78,7 @@
       "remaining-time", "activity-label", "progress-label", "overall-progress", "camera-name", "media-badge",
       "media-placeholder", "snapshot-image", "stream-video", "media-mode", "media-age", "battery-badge",
       "battery-voltage", "battery-level", "battery-check", "snapshot-successes", "snapshot-failures", "stream-bytes",
-      "snapshot-timeouts", "stream-reconnects", "chart-status", "battery-chart", "errors-empty", "errors-list", "last-updated",
+      "snapshot-timeouts", "stream-reconnects", "stream-receiving", "stream-outage", "chart-status", "battery-chart", "errors-empty", "errors-list", "last-updated",
       "history-summary", "phase-summary", "measurements-table-body",
       "confirmation-dialog", "confirmation-message", "confirmation-consequence", "cancel-action", "confirm-action",
       "toast-region",
@@ -142,6 +142,7 @@
       setConnection(true);
     } catch (error) {
       setConnection(false, error.name === "AbortError" ? "Status request timed out" : error.message);
+      renderStreamHealthUnavailable();
     } finally {
       runtime.polling.status = false;
     }
@@ -179,6 +180,7 @@
     const battery = raw.battery || raw.latest_battery || raw.last_battery || {};
     const counters = raw.counters || {};
     const media = raw.media || {};
+    const stream = raw.stream || {};
     const controls = raw.controls || raw.allowed_actions || {};
     const adapter = raw.adapter || {};
     const state = raw.state || raw.experiment_state || "not_started";
@@ -209,6 +211,11 @@
         snapshotTimeouts: integer(firstDefined(counters.snapshot_timeouts, counters.snapshot_timeout_count, raw.snapshot_timeouts, raw.snapshot_timeout_count)),
         streamBytes: integer(firstDefined(counters.received_stream_bytes, counters.stream_bytes, raw.received_stream_bytes, raw.stream_bytes)),
         streamReconnects: integer(firstDefined(counters.stream_reconnect_count, counters.stream_reconnects, raw.stream_reconnect_count, raw.stream_reconnects)),
+      },
+      stream: {
+        receiving: Boolean(firstDefined(stream.receiving, raw.stream_receiving, false)),
+        outageSeconds: finiteOrNull(firstDefined(stream.outage_seconds, raw.stream_outage_seconds)),
+        fatalOutageSeconds: finiteOrNull(firstDefined(stream.fatal_outage_seconds, raw.stream_fatal_outage_seconds)),
       },
       media: {
         mode: firstDefined(media.mode, raw.media_mode, state === "running_stream" ? "stream" : "snapshot"),
@@ -248,6 +255,7 @@
     renderCallout(status);
     renderBattery(status.battery);
     renderCounters(status.counters);
+    renderStreamHealth(status.stream, status.state);
     renderMedia(status.media, status.state);
     updateClocks();
     dom.lastUpdated.textContent = `Updated ${new Intl.DateTimeFormat(undefined, { timeStyle: "medium" }).format(new Date())}`;
@@ -300,6 +308,28 @@
     dom.snapshotTimeouts.textContent = formatInteger(counters.snapshotTimeouts);
     dom.streamBytes.textContent = formatBytes(counters.streamBytes);
     dom.streamReconnects.textContent = formatInteger(counters.streamReconnects);
+  }
+
+  function renderStreamHealth(stream, state) {
+    if (state !== "running_stream") {
+      dom.streamReceiving.textContent = "Inactive";
+      dom.streamReceiving.variant = "neutral";
+      dom.streamOutage.textContent = "Not active";
+      return;
+    }
+    dom.streamReceiving.textContent = stream.receiving ? "Receiving" : "No data";
+    dom.streamReceiving.variant = stream.receiving ? "success" : "danger";
+    const outage = stream.outageSeconds === null ? 0 : stream.outageSeconds;
+    const threshold = stream.fatalOutageSeconds;
+    dom.streamOutage.textContent = threshold === null
+      ? formatDuration(outage)
+      : `${formatDuration(outage)} / ${formatDuration(threshold)} fatal threshold`;
+  }
+
+  function renderStreamHealthUnavailable() {
+    dom.streamReceiving.textContent = "Unknown";
+    dom.streamReceiving.variant = "neutral";
+    dom.streamOutage.textContent = "Status unavailable";
   }
 
   function renderMedia(media, state) {
@@ -398,7 +428,9 @@
   function updateClocks() {
     if (!runtime.status) return;
     const delta = Math.max(0, (Date.now() - runtime.statusReceivedAt) / 1000);
-    const advances = runtime.status.state.startsWith("running_") || runtime.status.state === "recovery";
+    // Stream elapsed is evidence-based and advances only when the server observes
+    // adjacent positive byte receipts; never synthesize it from browser wall time.
+    const advances = runtime.status.state === "running_snapshot" || runtime.status.state === "recovery";
     const elapsed = (runtime.status.elapsedSeconds || 0) + (advances ? delta : 0);
     const remaining = runtime.status.remainingSeconds === null
       ? null

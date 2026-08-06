@@ -66,7 +66,7 @@ class FakeBackend:
             camera_status="online",
         )
 
-    async def run_stream(self, on_bytes, stop_event, on_reconnect):
+    async def run_stream(self, on_bytes, stop_event, on_reconnect, on_error):
         self.stream_connections += 1
         if self.stream_connections > 1:
             on_reconnect()
@@ -82,6 +82,7 @@ def short_config(**changes):
         battery_poll_seconds=0.01,
         measurement_interval_seconds=0.01,
         stream_checkpoint_seconds=0.005,
+        stream_data_timeout_seconds=0.02,
         fatal_outage_seconds=1,
         tests=(
             ExperimentTestConfig("snap 1", "snapshot", 0.01),
@@ -92,6 +93,14 @@ def short_config(**changes):
     )
     values.update(changes)
     return ExperimentConfig(**values)
+
+
+def make_stream_runner(tmp_path, clock, backend, **config_changes):
+    storage = SQLiteStorage(tmp_path / "stream.db")
+    run = storage.create_run(now=clock.now())
+    storage.update_run(run.id, current_test_number=4, now=clock.now())
+    runner = ExperimentRunner(storage, short_config(**config_changes), backend, clock=clock)
+    return storage, runner
 
 
 async def wait_for(predicate, attempts=1000):
@@ -325,3 +334,357 @@ async def test_non_timeout_snapshot_errors_increment_failure_only(tmp_path):
     assert run.snapshots_attempted == 1
     assert run.snapshots_failed == 1
     assert run.snapshot_timeouts == 0
+
+
+@pytest.mark.asyncio
+async def test_zero_byte_stream_stops_at_fatal_outage_despite_battery_success(tmp_path):
+    class NoDataBackend(FakeBackend):
+        async def run_stream(self, on_bytes, stop_event, on_reconnect, on_error):
+            while not stop_event.is_set():
+                await asyncio.sleep(0)
+
+    clock = FakeClock()
+    backend = NoDataBackend(clock)
+    storage, runner = make_stream_runner(
+        tmp_path,
+        clock,
+        backend,
+        test_duration_seconds=100,
+        battery_poll_seconds=0.1,
+        fatal_outage_seconds=1,
+    )
+
+    await runner.start()
+    await wait_for(lambda: runner.current_run.state == ExperimentState.STOPPED_ERROR.value)
+
+    assert runner.current_run.active_elapsed_seconds == 0
+    assert runner.current_run.stream_bytes == 0
+    assert "Continuous stream outage exceeded 1s" in runner.current_run.latest_error
+    assert backend.last_state == "ok"  # successful battery polls did not clear the outage
+    assert storage.list_phases(runner.current_run.id)[0]["outcome"] == "error"
+
+
+def test_stream_elapsed_counts_only_sustained_receipt_intervals(tmp_path):
+    clock = FakeClock()
+    backend = FakeBackend(clock)
+    storage, runner = make_stream_runner(
+        tmp_path,
+        clock,
+        backend,
+        stream_data_timeout_seconds=5,
+        fatal_outage_seconds=10,
+        test_duration_seconds=100,
+    )
+    runner._run = storage.update_run(
+        runner.current_run.id,
+        state=ExperimentState.RUNNING_STREAM.value,
+        now=clock.now(),
+    )
+    runner._begin_active_locked(resumed=False)
+
+    clock.advance(4)  # pre-first-byte time is invalid
+    runner._note_stream_bytes(188)
+    assert runner.get_status().active_elapsed_seconds == 0
+    clock.advance(3)
+    runner._note_stream_bytes(188)
+    assert runner.get_status().active_elapsed_seconds == pytest.approx(3)
+
+    clock.advance(8)
+    outage = runner.get_status()
+    assert not outage.stream_receiving
+    assert outage.stream_outage_seconds == pytest.approx(8)
+    runner._note_stream_bytes(188)  # outage gap is deliberately not credited
+    clock.advance(2)
+    runner._note_stream_bytes(188)
+    assert runner.get_status().active_elapsed_seconds == pytest.approx(5)
+
+    runner._note_stream_error("ffmpeg_failure", "encoder exited")
+    clock.advance(1)
+    runner._note_stream_bytes(188)  # explicit failure also breaks the valid interval
+    assert runner.get_status().active_elapsed_seconds == pytest.approx(5)
+    clock.advance(1)
+    runner._note_stream_bytes(188)
+    assert runner.get_status().active_elapsed_seconds == pytest.approx(6)
+
+    runner._checkpoint_active_locked()
+    persisted = storage.get_run(runner.current_run.id)
+    assert persisted is not None
+    assert persisted.active_elapsed_seconds == pytest.approx(6)
+    assert persisted.stream_bytes == 188 * 6
+
+
+@pytest.mark.asyncio
+async def test_stream_outage_is_independent_of_successful_battery_poll(tmp_path):
+    clock = FakeClock()
+    backend = FakeBackend(clock)
+    _storage, runner = make_stream_runner(tmp_path, clock, backend)
+    runner._run = runner.storage.update_run(
+        runner.current_run.id,
+        state=ExperimentState.RUNNING_STREAM.value,
+        now=clock.now(),
+    )
+    runner._begin_active_locked(resumed=False)
+    clock.advance(0.75)
+
+    assert not await runner._poll_battery(runner._generation)
+    status = runner.get_status()
+    assert not status.stream_receiving
+    assert status.stream_outage_seconds == pytest.approx(0.75)
+
+
+@pytest.mark.asyncio
+async def test_internal_ffmpeg_errors_reach_runner_and_become_fatal(tmp_path):
+    class RetryingBackend(FakeBackend):
+        async def run_stream(self, on_bytes, stop_event, on_reconnect, on_error):
+            on_error("ffmpeg_failure", "encoder exited with code 1")
+            while not stop_event.is_set():
+                await asyncio.sleep(0)
+
+    clock = FakeClock()
+    backend = RetryingBackend(clock)
+    storage, runner = make_stream_runner(
+        tmp_path,
+        clock,
+        backend,
+        test_duration_seconds=100,
+        fatal_outage_seconds=0.5,
+    )
+
+    await runner.start()
+    await wait_for(lambda: runner.current_run.state == ExperimentState.STOPPED_ERROR.value)
+
+    events = storage.list_events(runner.current_run.id)
+    assert any(event["category"] == "ffmpeg_failure" for event in events)
+    assert "without stream data" in runner.current_run.latest_error
+
+
+@pytest.mark.asyncio
+async def test_stream_valid_elapsed_and_counters_survive_runner_restart(tmp_path):
+    clock = FakeClock()
+    backend = FakeBackend(clock)
+    storage, first = make_stream_runner(
+        tmp_path,
+        clock,
+        backend,
+        stream_data_timeout_seconds=5,
+        fatal_outage_seconds=10,
+        test_duration_seconds=100,
+    )
+    first._run = storage.update_run(
+        first.current_run.id,
+        state=ExperimentState.RUNNING_STREAM.value,
+        now=clock.now(),
+    )
+    first._begin_active_locked(resumed=False)
+    first._note_stream_bytes(100)
+    clock.advance(2)
+    first._note_stream_bytes(200)
+    first._checkpoint_active_locked()
+
+    resumed = ExperimentRunner(storage, first.config, backend, clock=clock)
+    assert resumed.get_status().active_elapsed_seconds == pytest.approx(2)
+    assert resumed.current_run.stream_bytes == 300
+    await resumed.initialize()
+    assert resumed.get_status().active_elapsed_seconds == pytest.approx(2)
+    assert not resumed.get_status().stream_receiving
+    await resumed.shutdown()
+
+
+def test_stream_data_timeout_must_be_positive(tmp_path):
+    (tmp_path / "config.toml").write_text(
+        "[experiment]\nstream_data_timeout_seconds=0\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="stream_data_timeout_seconds must be greater"):
+        load_config(tmp_path)
+
+
+def test_stream_data_timeout_cannot_exceed_fatal_outage(tmp_path):
+    (tmp_path / "config.toml").write_text(
+        "[experiment]\nstream_data_timeout_seconds=11\nfatal_outage_seconds=10\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="cannot exceed"):
+        load_config(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_near_threshold_stream_outage_survives_clean_restart(tmp_path):
+    class NoDataBackend(FakeBackend):
+        async def run_stream(self, on_bytes, stop_event, on_reconnect, on_error):
+            while not stop_event.is_set():
+                await asyncio.sleep(0)
+
+    clock = FakeClock()
+    backend = NoDataBackend(clock)
+    storage, first = make_stream_runner(
+        tmp_path,
+        clock,
+        backend,
+        stream_data_timeout_seconds=0.2,
+        fatal_outage_seconds=1,
+        test_duration_seconds=100,
+    )
+    first._run = storage.update_run(
+        first.current_run.id,
+        state=ExperimentState.RUNNING_STREAM.value,
+        now=clock.now(),
+    )
+    first._begin_active_locked(resumed=False)
+    clock.advance(0.8)
+    await first.shutdown()
+    persisted = storage.get_run(first.current_run.id)
+    assert persisted is not None
+    assert persisted.stream_outage_active
+    assert persisted.stream_outage_seconds == pytest.approx(0.8)
+
+    resumed = ExperimentRunner(storage, first.config, backend, clock=clock)
+    restart_at = clock.monotonic()
+    await resumed.initialize()
+    assert resumed.get_status().stream_outage_seconds == pytest.approx(0.8)
+    await wait_for(lambda: resumed.current_run.state == ExperimentState.STOPPED_ERROR.value)
+    assert clock.monotonic() - restart_at <= 0.25
+    assert "Continuous stream outage exceeded" in resumed.current_run.latest_error
+
+
+@pytest.mark.asyncio
+async def test_uncheckpointed_crash_outage_is_recovered_from_utc_checkpoint(tmp_path):
+    class NoDataBackend(FakeBackend):
+        async def run_stream(self, on_bytes, stop_event, on_reconnect, on_error):
+            while not stop_event.is_set():
+                await asyncio.sleep(0)
+
+    clock = FakeClock()
+    backend = NoDataBackend(clock)
+    storage, crashed = make_stream_runner(
+        tmp_path,
+        clock,
+        backend,
+        stream_data_timeout_seconds=0.2,
+        fatal_outage_seconds=1,
+        test_duration_seconds=100,
+    )
+    crashed._run = storage.update_run(
+        crashed.current_run.id,
+        state=ExperimentState.RUNNING_STREAM.value,
+        now=clock.now(),
+    )
+    crashed._begin_active_locked(resumed=False)
+    clock.advance(0.8)  # simulate a crash before the periodic checkpoint
+
+    resumed = ExperimentRunner(storage, crashed.config, backend, clock=clock)
+    restart_at = clock.monotonic()
+    await resumed.initialize()
+    assert resumed.get_status().stream_outage_seconds == pytest.approx(0.8)
+    await wait_for(lambda: resumed.current_run.state == ExperimentState.STOPPED_ERROR.value)
+    assert clock.monotonic() - restart_at <= 0.25
+
+
+def test_repeated_reconstruction_cannot_reset_stream_outage(tmp_path):
+    clock = FakeClock()
+    backend = FakeBackend(clock)
+    storage, runner = make_stream_runner(
+        tmp_path,
+        clock,
+        backend,
+        stream_data_timeout_seconds=0.2,
+        fatal_outage_seconds=1,
+        test_duration_seconds=100,
+    )
+    runner._run = storage.update_run(
+        runner.current_run.id,
+        state=ExperimentState.RUNNING_STREAM.value,
+        now=clock.now(),
+    )
+    runner._begin_active_locked(resumed=False)
+
+    for _ in range(3):
+        clock.advance(0.3)
+        # Reconstruct before a periodic checkpoint; the durable UTC checkpoint
+        # still carries each prior process's outage time forward.
+        runner = ExperimentRunner(storage, runner.config, backend, clock=clock)
+        runner._begin_active_locked(resumed=True, account_closed_outage=True)
+
+    assert runner.get_status().stream_outage_seconds == pytest.approx(0.9)
+    clock.advance(0.11)
+    assert runner._stream_outage_is_fatal()
+
+
+def test_first_post_resume_receipt_clears_carried_outage_without_credit(tmp_path):
+    clock = FakeClock()
+    backend = FakeBackend(clock)
+    storage, first = make_stream_runner(
+        tmp_path,
+        clock,
+        backend,
+        stream_data_timeout_seconds=5,
+        fatal_outage_seconds=10,
+        test_duration_seconds=100,
+    )
+    first._run = storage.update_run(
+        first.current_run.id,
+        state=ExperimentState.RUNNING_STREAM.value,
+        now=clock.now(),
+    )
+    first._begin_active_locked(resumed=False)
+    clock.advance(4)
+    first._checkpoint_active_locked()
+
+    clock.advance(20)  # manual-paused time is intentionally excluded
+    resumed = ExperimentRunner(storage, first.config, backend, clock=clock)
+    resumed._begin_active_locked(resumed=True, account_closed_outage=False)
+    assert resumed.get_status().stream_outage_seconds == pytest.approx(4)
+
+    resumed._note_stream_bytes(100)
+    cleared = storage.get_run(resumed.current_run.id)
+    assert cleared is not None
+    assert cleared.stream_outage_active is False
+    assert cleared.stream_outage_seconds == 0
+    assert resumed.get_status().active_elapsed_seconds == 0
+    clock.advance(1)
+    resumed._note_stream_bytes(100)
+    assert resumed.get_status().active_elapsed_seconds == pytest.approx(1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend_exits", [False, True])
+async def test_stream_fatal_outage_does_not_wait_for_blocking_battery(tmp_path, backend_exits):
+    class BlockingBatteryBackend(FakeBackend):
+        def __init__(self, clock):
+            super().__init__(clock)
+            self.battery_started = False
+            self.battery_cancelled = False
+
+        async def read_battery(self):
+            self.battery_started = True
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.battery_cancelled = True
+                raise
+
+        async def run_stream(self, on_bytes, stop_event, on_reconnect, on_error):
+            if backend_exits:
+                return
+            while not stop_event.is_set():
+                await asyncio.sleep(0)
+
+    clock = FakeClock()
+    backend = BlockingBatteryBackend(clock)
+    _storage, runner = make_stream_runner(
+        tmp_path,
+        clock,
+        backend,
+        stream_data_timeout_seconds=0.2,
+        fatal_outage_seconds=0.5,
+        battery_poll_seconds=100,
+        test_duration_seconds=100,
+    )
+
+    await runner.start()
+    await wait_for(lambda: runner.current_run.state == ExperimentState.STOPPED_ERROR.value)
+    await wait_for(lambda: backend.battery_cancelled)
+
+    assert backend.battery_started
+    assert backend.battery_cancelled
+    assert runner.current_run.active_elapsed_seconds == 0
+    assert "Continuous stream outage exceeded" in runner.current_run.latest_error
