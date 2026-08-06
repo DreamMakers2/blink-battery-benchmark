@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en" class="wa-theme-awesome wa-palette-bright wa-light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>Blink Doorbell Battery Test</title>
+    <link rel="stylesheet" href="/static/vendor/webawesome/styles/webawesome.css" />
+    <link rel="stylesheet" href="/static/vendor/webawesome/styles/themes/awesome-local.css" />
+    <link rel="stylesheet" href="/static/style.css" />
+    <script type="module" src="/static/icon-setup.js"></script>
+    <script type="module" src="/static/vendor/webawesome/webawesome.loader.js"></script>
+    <script defer src="/static/vendor/chart.umd.min.js"></script>
+    <script defer src="/static/vendor/hls.min.js"></script>
+    <script defer src="/static/app.js"></script>
+  </head>
+  <body>
+    <div class="mesh" aria-hidden="true"></div>
+
+    <wa-page id="app-page" mobile-breakpoint="45em">
+      <header slot="header" class="app-header wa-split">
+        <div class="brand wa-cluster wa-gap-s">
+          <span class="brand-mark" aria-hidden="true"><wa-icon name="door-open"></wa-icon></span>
+          <div class="wa-stack wa-gap-3xs">
+            <span class="eyebrow">Blink Doorbell</span>
+            <span class="product-name">Battery test dashboard</span>
+          </div>
+        </div>
+
+        <div class="header-actions wa-cluster wa-gap-xs" aria-label="Experiment controls">
+          <span id="connection-status" class="connection-status" role="status" aria-live="polite">
+            Connecting
+          </span>
+          <wa-badge id="phase-badge" variant="neutral" appearance="filled" pill>Not started</wa-badge>
+          <wa-button id="start-button" data-action="start" variant="brand" appearance="accent" size="s" pill>
+            <wa-icon slot="start" name="play"></wa-icon>
+            Start
+          </wa-button>
+          <wa-button id="stop-button" data-action="stop" variant="danger" appearance="filled" size="s" pill disabled>
+            <wa-icon slot="start" name="stop"></wa-icon>
+            Stop
+          </wa-button>
+          <wa-button id="restart-button" data-action="restart" variant="neutral" appearance="filled" size="s" pill disabled>
+            <wa-icon slot="start" name="rotate-right"></wa-icon>
+            Restart
+          </wa-button>
+          <wa-button id="continue-button" data-action="continue" variant="warning" appearance="accent" size="s" pill hidden>
+            <wa-icon slot="start" name="forward-step"></wa-icon>
+            Continue with next test
+          </wa-button>
+        </div>
+      </header>
+
+      <main id="main-content">
+        <div class="content-shell wa-stack wa-gap-l">
+          <wa-callout id="state-callout" variant="warning" appearance="filled" size="l" hidden>
+            <wa-icon slot="icon" name="triangle-exclamation"></wa-icon>
+            <div class="wa-stack wa-gap-3xs">
+              <strong id="callout-title">Experiment paused</strong>
+              <span id="callout-message">Camera activity has stopped.</span>
+            </div>
+          </wa-callout>
+
+          <wa-card class="surface-card status-card" appearance="filled" with-header>
+            <div slot="header" class="card-heading wa-split">
+              <div class="wa-stack wa-gap-3xs">
+                <span class="eyebrow">Current experiment</span>
+                <h1 id="test-name">Ready for test 1</h1>
+              </div>
+              <span id="test-step" class="quiet-copy">Test 0 of 4</span>
+            </div>
+
+            <div class="wa-stack wa-gap-m">
+              <div class="timeline-grid wa-grid wa-gap-s">
+                <div class="timeline-item wa-stack wa-gap-3xs">
+                  <span class="metric-label">Started</span>
+                  <strong id="start-time">Not started</strong>
+                </div>
+                <div class="timeline-item wa-stack wa-gap-3xs">
+                  <span class="metric-label">Elapsed</span>
+                  <strong id="elapsed-time">0s</strong>
+                </div>
+                <div class="timeline-item wa-stack wa-gap-3xs">
+                  <span class="metric-label">Remaining</span>
+                  <strong id="remaining-time">Not available</strong>
+                </div>
+                <div class="timeline-item wa-stack wa-gap-3xs">
+                  <span class="metric-label">Activity</span>
+                  <strong id="activity-label">Waiting to start</strong>
+                </div>
+              </div>
+
+              <div class="wa-stack wa-gap-xs">
+                <div class="wa-split progress-copy">
+                  <span>Overall progress</span>
+                  <strong id="progress-label">0%</strong>
+                </div>
+                <wa-progress-bar id="overall-progress" value="0" label="Overall experiment progress"></wa-progress-bar>
+              </div>
+            </div>
+          </wa-card>
+
+          <section class="primary-grid" aria-label="Camera and current metrics">
+            <wa-card class="surface-card camera-card" appearance="filled" with-header>
+              <div slot="header" class="card-heading wa-split">
+                <div class="wa-stack wa-gap-3xs">
+                  <span class="eyebrow">Camera output</span>
+                  <h2 id="camera-name">Selected doorbell</h2>
+                </div>
+                <wa-badge id="media-badge" variant="neutral" appearance="filled" pill>Waiting</wa-badge>
+              </div>
+
+              <figure class="camera-figure wa-stack wa-gap-s">
+                <div class="media-frame">
+                  <div id="media-placeholder" class="media-placeholder wa-stack wa-gap-s" role="status">
+                    <wa-icon name="camera" label="Camera output unavailable"></wa-icon>
+                    <span>Waiting for the first camera image</span>
+                  </div>
+                  <img id="snapshot-image" alt="Latest successful snapshot from the selected Blink doorbell" hidden />
+                  <video id="stream-video" aria-label="Live video from the selected Blink doorbell" controls muted playsinline hidden></video>
+                </div>
+                <figcaption class="wa-split quiet-copy">
+                  <span id="media-mode">Snapshot fallback</span>
+                  <span id="media-age">No media received</span>
+                </figcaption>
+              </figure>
+            </wa-card>
+
+            <wa-card class="surface-card metrics-card" appearance="filled" with-header>
+              <div slot="header" class="card-heading wa-stack wa-gap-3xs">
+                <span class="eyebrow">Live readings</span>
+                <h2>Battery and activity</h2>
+              </div>
+
+              <dl class="metrics-list wa-stack wa-gap-xs">
+                <div class="metric-row metric-featured">
+                  <dt>Battery state</dt>
+                  <dd><wa-badge id="battery-badge" variant="neutral" appearance="filled" pill>Unknown</wa-badge></dd>
+                </div>
+                <div class="metric-row">
+                  <dt>Voltage</dt>
+                  <dd id="battery-voltage">Not available</dd>
+                </div>
+                <div class="metric-row">
+                  <dt>Raw battery level</dt>
+                  <dd id="battery-level">Not available</dd>
+                </div>
+                <div class="metric-row">
+                  <dt>Last Blink check</dt>
+                  <dd id="battery-check">Not available</dd>
+                </div>
+                <div class="metric-row">
+                  <dt>Snapshots</dt>
+                  <dd>
+                    <span id="snapshot-successes">0</span> successful /
+                    <span id="snapshot-failures">0</span> failed /
+                    <span id="snapshot-timeouts">0</span> timed out
+                  </dd>
+                </div>
+                <div class="metric-row">
+                  <dt>Stream received</dt>
+                  <dd id="stream-bytes">0 B</dd>
+                </div>
+                <div class="metric-row">
+                  <dt>Stream reconnects</dt>
+                  <dd id="stream-reconnects">0</dd>
+                </div>
+              </dl>
+            </wa-card>
+          </section>
+
+          <wa-card class="surface-card chart-card" appearance="filled" with-header>
+            <div slot="header" class="card-heading wa-split">
+              <div class="wa-stack wa-gap-3xs">
+                <span class="eyebrow">Full experiment timeline</span>
+                <h2>Battery history</h2>
+              </div>
+              <span id="chart-status" class="quiet-copy" role="status">Waiting for measurements</span>
+            </div>
+            <div class="chart-frame">
+              <canvas id="battery-chart" aria-label="Battery voltage and raw battery level over the experiment timeline" role="img"></canvas>
+            </div>
+            <wa-details id="accessible-history" summary="Accessible battery history" appearance="outlined">
+              <div class="wa-stack wa-gap-s">
+                <p id="history-summary" class="quiet-copy" aria-live="polite">No battery measurements yet.</p>
+                <p id="phase-summary" class="quiet-copy">No experiment phases recorded yet.</p>
+                <a class="history-download" href="/api/measurements?limit=100000" download="blink-battery-measurements.json">
+                  Download complete measurement history as JSON
+                </a>
+                <div class="history-table-wrap" role="region" aria-label="Recent battery history table" tabindex="0">
+                  <table class="history-table">
+                    <caption>Up to 200 most recent measurements; download JSON for the complete history.</caption>
+                    <thead>
+                      <tr>
+                        <th scope="col">Time</th>
+                        <th scope="col">Test or phase</th>
+                        <th scope="col">Voltage</th>
+                        <th scope="col">Raw level</th>
+                      </tr>
+                    </thead>
+                    <tbody id="measurements-table-body"></tbody>
+                  </table>
+                </div>
+              </div>
+            </wa-details>
+          </wa-card>
+
+          <wa-details id="errors-details" summary="Recent warnings and errors" appearance="filled">
+            <div id="errors-empty" class="empty-errors">No warnings or errors recorded.</div>
+            <ol id="errors-list" class="errors-list wa-stack wa-gap-xs" hidden></ol>
+          </wa-details>
+
+          <footer class="page-footer wa-split quiet-copy">
+            <span>Local experiment dashboard</span>
+            <span id="last-updated">Not yet updated</span>
+          </footer>
+        </div>
+      </main>
+    </wa-page>
+
+    <wa-dialog id="confirmation-dialog" label="Confirm experiment action" with-footer>
+      <div class="wa-stack wa-gap-s">
+        <p id="confirmation-message">Confirm this experiment action.</p>
+        <p id="confirmation-consequence" class="quiet-copy"></p>
+      </div>
+      <wa-button slot="footer" id="cancel-action" variant="neutral" appearance="filled" data-dialog="close">Cancel</wa-button>
+      <wa-button slot="footer" id="confirm-action" variant="danger" appearance="accent" autofocus>Confirm</wa-button>
+    </wa-dialog>
+
+    <div id="toast-region" class="toast-region wa-stack wa-gap-xs" aria-live="polite" aria-atomic="true"></div>
+  </body>
+</html>

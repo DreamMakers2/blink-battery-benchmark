@@ -1,0 +1,28 @@
+# Copy this file to config.local.toml for a short non-production exercise.
+[experiment]
+test_duration_seconds = 60
+recovery_duration_seconds = 20
+battery_poll_seconds = 5
+measurement_interval_seconds = 5
+stream_checkpoint_seconds = 2
+fatal_outage_seconds = 30
+development_mode = true
+
+[[experiment.tests]]
+name = "Snapshot every 15 seconds"
+kind = "snapshot"
+snapshot_interval_seconds = 15
+
+[[experiment.tests]]
+name = "Snapshot every 10 seconds"
+kind = "snapshot"
+snapshot_interval_seconds = 10
+
+[[experiment.tests]]
+name = "Snapshot every 5 seconds"
+kind = "snapshot"
+snapshot_interval_seconds = 5
+
+[[experiment.tests]]
+name = "Continuous live stream"
+kind = "stream"

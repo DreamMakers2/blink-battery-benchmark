@@ -1,0 +1,55 @@
+[server]
+dashboard_host = "127.0.0.1"
+dashboard_port = 8090
+allow_lan = false
+
+[blink]
+http_base_url = "http://127.0.0.1:8080"
+stream_host = "127.0.0.1"
+stream_port = 5000
+request_timeout_seconds = 120
+battery_timeout_seconds = 30
+stream_connect_timeout_seconds = 10
+stream_reconnect_seconds = 2
+low_battery_states = ["low", "replace", "replace_battery", "needs_replacement"]
+
+[experiment]
+test_duration_seconds = 43200
+recovery_duration_seconds = 43200
+battery_poll_seconds = 300
+measurement_interval_seconds = 300
+stream_checkpoint_seconds = 5
+fatal_outage_seconds = 3600
+development_mode = false
+
+[[experiment.tests]]
+name = "Snapshot every 300 seconds"
+kind = "snapshot"
+snapshot_interval_seconds = 300
+
+[[experiment.tests]]
+name = "Snapshot every 60 seconds"
+kind = "snapshot"
+snapshot_interval_seconds = 60
+
+[[experiment.tests]]
+name = "Snapshot every 30 seconds"
+kind = "snapshot"
+snapshot_interval_seconds = 30
+
+[[experiment.tests]]
+name = "Continuous live stream"
+kind = "stream"
+
+[paths]
+runtime_dir = "runtime"
+database = "runtime/data/experiment.db"
+latest_jpeg = "runtime/data/latest.jpg"
+hls_dir = "runtime/data/hls"
+private_dir = "runtime/private"
+log_file = "runtime/logs/application.log"
+
+[media]
+ffmpeg_executable = "ffmpeg"
+hls_segment_seconds = 2
+hls_list_size = 6

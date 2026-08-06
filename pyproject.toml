@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "blink-battery-dashboard"
+version = "0.1.0"
+description = "Local Blink doorbell battery experiment dashboard"
+requires-python = ">=3.10"
+dependencies = [
+  "aiohttp==3.14.3",
+  "blinkpy==0.25.9",
+  "Pillow==11.3.0",
+  "tomli==2.2.1; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest==8.4.2",
+  "pytest-asyncio==1.2.0",
+]
+
+[project.scripts]
+blink-battery-dashboard = "blink_dashboard.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/blink_dashboard"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
