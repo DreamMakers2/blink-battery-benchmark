@@ -1,0 +1,19 @@
+{
+  "webawesome": {
+    "version": "3.9.0",
+    "npm_integrity": "sha512-doKgUCglb/E1d/dYSzXQQthlYmyndFOtG/Vr5HyHjIFqNwn/tbutMsIMYJrYFEjq07vPwcOHKeAulbiqoslRoQ=="
+  },
+  "fontawesome-free": {
+    "version": "7.2.0",
+    "sha256": "a6e6c61ed84b685e400ff74fce1f0ae3ded93784db4b883c53089dceaf9cb06f",
+    "included": "seven solid SVG icons used by the dashboard"
+  },
+  "chart.js": {
+    "version": "4.5.1",
+    "sha256": "48444a82d4edcb5bec0f1965faacdde18d9c17db3063d042abada2f705c9f54a"
+  },
+  "hls.js": {
+    "version": "1.6.16",
+    "sha256": "442f599c34f103c3355b375a23bdff560592d7117d09a8c847242ea3de2d40e0"
+  }
+}

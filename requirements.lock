@@ -1,0 +1,2 @@
+# Runtime dependencies are pinned here so launch.cmd installs repeatably.
+-e .

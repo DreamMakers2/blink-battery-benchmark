@@ -1,0 +1,39 @@
+# Python environments and packaging
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Local runtime data and private configuration
+runtime/
+config.local.toml
+.env
+.env.*
+!.env.example
+
+# Python and test/tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Logs and temporary files
+*.log
+*.tmp
+.temp/
+.tmp/
+
+# Editor and operating-system metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local agent/tool state
+/.agents/
+/.codex/

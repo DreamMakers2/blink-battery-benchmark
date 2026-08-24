@@ -1,0 +1,20 @@
+Blink Battery Experiment Dashboard
+Copyright 2026 project contributors
+
+Project-authored material is licensed under the Apache License, Version 2.0,
+subject to the Commons Clause License Condition v1.0. See LICENSE.
+
+The combined license is source-available and is not an OSI-approved open-source
+license because the Commons Clause restricts selling the Software as defined in
+that condition.
+
+Bundled third-party browser assets retain their own copyrights and licenses.
+See static/vendor/THIRD_PARTY_NOTICES.md and the license files distributed with
+those assets.
+
+The managed blinkliveview dependency is downloaded at setup time from its
+upstream project and retains its upstream license.
+
+This project is independent and unofficial. Blink and Amazon names and marks
+belong to their respective owners. No affiliation, endorsement, or support is
+claimed.
