@@ -1,126 +1,108 @@
-# Blink Doorbell Battery Test Dashboard
+# Blink Battery Experiment Dashboard
 
-A Windows-first, local dashboard for running a restart-safe four-stage battery-usage experiment against one Blink doorbell. It schedules snapshots or a continuous live view, records fresh battery readings and operational counters in SQLite, and presents camera output, status, history, and errors in a responsive browser UI.
+> Local, restart-safe tooling for measuring Blink doorbell battery behavior under scheduled snapshots and continuous live view.
 
-The normal entry point is parameter-free:
+![Status: pre-release](https://img.shields.io/badge/status-pre--release-orange)
+![Python: 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
+![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D4)
+![License: Apache 2.0 + Commons Clause](https://img.shields.io/badge/license-Apache--2.0%20%2B%20Commons%20Clause-lightgrey)
+
+> [!WARNING]
+> **Pre-release and only partially tested.** The latest revision has not completed full hardware and long-duration validation and **still contains bugs that need to be fixed**. Treat results as experimental rather than production-grade.
+
+> [!CAUTION]
+> Use this software at your own risk. It can generate repeated camera activity, consume battery, write local experiment data, and depend on third-party Blink behavior that can change. Do not rely on it for safety, security monitoring, or any use where camera availability is critical.
+
+This project runs a four-stage battery experiment against one Blink doorbell. It schedules three snapshot workloads followed by a continuous live-view workload, records fresh battery readings and operational counters in SQLite, survives application restarts, and presents status, media, history, and errors in a local browser dashboard.
+
+The project is independent and unofficial. It is not affiliated with, endorsed by, or supported by Amazon or Blink.
+
+## 🧩 Architecture
+
+![Blink Battery Experiment Dashboard architecture](docs/architecture.svg)
+
+```mermaid
+flowchart LR
+    Browser["Browser UI"]
+    Dashboard["aiohttp dashboard<br/>127.0.0.1:8090 by default"]
+    Runner["Experiment runner<br/>state machine + scheduling"]
+    DB[("SQLite<br/>runtime/data/experiment.db")]
+    Media["HLS media consumer<br/>FFmpeg"]
+    Adapter["Blink adapter<br/>loopback only"]
+    Auth[("DPAPI auth<br/>runtime/private/auth.dpapi")]
+    Blink["Blink service / doorbell"]
+
+    Browser <-->|HTTP| Dashboard
+    Dashboard --> Runner
+    Runner --> DB
+    Runner -->|snapshot + battery<br/>HTTP 127.0.0.1:8080| Adapter
+    Adapter --> Auth
+    Adapter <-->|Blink API / live view| Blink
+    Adapter -->|MPEG-TS<br/>TCP 127.0.0.1:5000| Media
+    Media -->|HLS files| Dashboard
+```
+
+The dashboard is loopback-only by default. The adapter remains loopback-only even when the dashboard is explicitly configured for LAN access. See [Architecture](docs/ARCHITECTURE.md) and [Security](SECURITY.md) for boundaries and caveats.
+
+## Experiment sequence
+
+The committed defaults run:
+
+1. Snapshot every 300 seconds for up to 12 active hours.
+2. Snapshot every 60 seconds for up to 12 active hours.
+3. Snapshot every 30 seconds for up to 12 active hours.
+4. Continuous live view until 12 receipt-confirmed active hours have accumulated.
+
+A 12-hour recovery period separates completed tests. Snapshot-test elapsed time pauses while the application is closed or manually stopped. Stream-test elapsed time advances only between sufficiently close positive stream-byte receipts; startup waits, disconnects, silent stalls, FFmpeg failures, and reconnect gaps do not count as valid stream time.
+
+Battery readings and experiment state are persisted in SQLite. A configured low/replacement battery state stops camera activity and requires a fresh non-low reading before an early continuation.
+
+## 🚀 Getting started
+
+The normal Windows entry point is parameter-free:
 
 ```text
 launch.cmd
 ```
 
-Double-click `launch.cmd` from File Explorer. No command-line parameters are required.
+On first launch, the launcher creates `.venv`, installs the pinned Python dependencies, downloads and verifies the pinned `blinkliveview` source revision, checks for FFmpeg, then prompts for Blink authentication and camera selection.
 
-## What the launcher does
+Before running it, read:
 
-On its first run, `launch.cmd`:
+- [Setup guide](docs/SETUP.md)
+- [Hardware and software requirements](docs/REQUIREMENTS.md)
+- [Troubleshooting](docs/TROUBLESHOOTING.md)
 
-1. Finds a Windows Python 3.10 or newer installation.
-2. Creates the project-local `.venv` environment.
-3. Installs the pinned Python application dependencies.
-4. Downloads the exact managed `blinkliveview` source revision and verifies its SHA-256 checksum.
-5. Verifies that `ffmpeg.exe` is available on `PATH`.
-6. Prompts in the launcher window for Blink credentials and MFA when Blink requires them.
-7. Prompts for a camera when the account has multiple cameras, or when a previously selected camera is no longer available.
-8. Starts both loopback services and opens `http://127.0.0.1:8090` in the default browser.
+## 🔒 Security model
 
-Later launches reuse the encrypted Blink session, selected camera, virtual environment, and managed dependency. When saved-session startup is temporarily unavailable, the adapter retains the encrypted record and retries automatically with capped exponential backoff. An ambiguous Blink or network failure never falls through to another username/password prompt. MFA is requested only when Blink explicitly reports that MFA is required, and one-time codes are never saved. To intentionally enter different credentials, close the dashboard and delete only `runtime/private/auth.dpapi` before launching again.
+- Blink credentials and reusable authentication state are stored in `runtime/private/auth.dpapi` using Windows DPAPI in current-user scope.
+- MFA one-time codes are not intentionally persisted.
+- `runtime/`, `config.local.toml`, environment files, logs, caches, and local tool state are excluded from Git.
+- The Blink adapter HTTP and TCP listeners are loopback-only.
+- The dashboard is loopback-only unless `server.allow_lan = true` is explicitly enabled.
+- LAN mode uses a random bearer token stored in `runtime/private/dashboard-access.token` and establishes an HTTP-only, SameSite cookie.
+- LAN transport is plain HTTP. The bearer controls access; it does **not** encrypt traffic.
+- Upstream live-view target details are intentionally suppressed from adapter output.
 
-The first setup needs internet access for Python packages, `blinkliveview`, and Blink authentication. Browser UI libraries, icons, styles, and fonts are served locally after checkout; the dashboard itself has no CDN dependency.
-
-## Prerequisites
-
-- Windows 10 or 11.
-- Python 3.10 or newer installed for the current user and available through `py` or `python`.
-- FFmpeg available as `ffmpeg.exe` on `PATH`.
-- A Blink account with access to the doorbell under test.
-- Internet access to Blink while the experiment is operating.
-
-To verify FFmpeg from a new Command Prompt:
-
-```bat
-ffmpeg -version
-```
-
-If that command is not found, install an FFmpeg Windows build, add its `bin` directory to `PATH`, and open a new Command Prompt before launching the dashboard.
-
-## Credential and local-data security
-
-Authentication state is stored at:
-
-```text
-runtime/private/auth.dpapi
-```
-
-That file is encrypted with Windows DPAPI in current-user scope. It can only be decrypted by the Windows account that created it. There is deliberately no plaintext or cross-platform credential fallback. Passwords, tokens, authorization values, and MFA fields are redacted from application logging.
-
-The following local/mutable paths are excluded by `.gitignore`:
-
-- `.venv/`
-- `runtime/`, including encrypted credentials, logs, SQLite data, media, and fetched upstream code
-- `config.local.toml`
-- Python/test caches and coverage output
-
-Do not move `auth.dpapi` to another Windows account expecting it to work. To force a clean sign-in, close the dashboard and delete only `runtime/private/auth.dpapi`; the next launch will prompt again. This does not delete experiment results.
-
-Both the adapter and dashboard bind to loopback by default. Exposing the dashboard to a LAN requires both changing `server.dashboard_host` and explicitly setting `server.allow_lan = true` in `config.local.toml`. LAN mode protects the UI, camera media, JSON endpoints, and controls with a random bearer stored in `runtime/private/dashboard-access.token`; the launcher uses it once in a redirecting URL to establish an HTTP-only, same-site browser cookie. Mutating controls additionally require same-origin JSON requests. The Blink adapter remains loopback-only.
-
-LAN transport is plain HTTP and is intended only for a private, trusted network. The access token prevents unauthenticated viewing and cross-site control requests, but it does not encrypt network traffic. Use a trusted reverse proxy with TLS if traffic may traverse an untrusted network.
-
-## Experiment sequence
-
-The committed defaults run these tests in order:
-
-1. A fresh snapshot every 300 seconds for up to 12 active hours.
-2. A fresh snapshot every 60 seconds for up to 12 active hours.
-3. A fresh snapshot every 30 seconds for up to 12 active hours.
-4. A continuously consumed live stream until 12 receipt-confirmed active hours have accumulated.
-
-A 12-hour recovery period separates completed tests. Recovery generates no snapshots and does not connect to the live stream, but battery polling and measurement recording continue.
-
-Snapshot-test duration uses monotonic elapsed time and pauses while the application is closed or manually stopped. Continuous-stream duration advances only across adjacent positive byte receipts within the configured stream-data timeout: time before the first byte, disconnects, FFmpeg failures, silent stalls, and reconnect waits do not count toward the 12-hour result. Receipt-confirmed stream time and counters are checkpointed to SQLite and survive application restarts. Recovery deadlines use wall-clock UTC, so a recovery period continues while the application is closed. The current run, open phase, counters, measurements, errors, and previous runs are durable in SQLite.
-
-When a fresh Blink reading reports a configured low/replacement state, camera activity stops immediately and the run enters `stopped_low_battery`. Automatic recovery monitoring continues. “Continue with next test” first requires a new successful, non-low Blink reading; it cannot override a battery that is still reported low.
-
-Transient snapshot, battery, stream, and FFmpeg errors are retained and retried. Stream health has its own outage clock, separate from successful battery or snapshot operations. It begins before the first stream byte and restarts after a disconnect, FFmpeg failure, or data-inactivity timeout; only new positive stream bytes clear it. The dashboard shows the current outage duration and fatal threshold. If the outage reaches `experiment.fatal_outage_seconds`, the run moves to `stopped_error` even while the internal media consumer is still retrying.
-
-An active stream outage is persisted immediately and checkpointed to SQLite. If the launcher closes or crashes while that outage is active, automatic startup includes the closed wall-clock interval in the same outage, so restarting cannot evade the fatal threshold. An intentional **Stop** is different: the accumulated outage is retained, but time spent manually paused is excluded. The first positive byte after a resume clears the carried outage without crediting the pause, outage, or reconnect gap as valid stream-test time. Stream battery checks run independently, so a slow or hung Blink request cannot delay outage enforcement.
-
-## Controls
-
-All mutating browser controls require confirmation:
-
-- **Start** begins a new run or resumes a manually stopped phase.
-- **Stop** halts camera activity and checkpoints the current run.
-- **Restart** preserves the old run as history and starts a new run from test 1.
-- **Continue with next test** is shown only after a low-battery stop and only succeeds after a fresh recovered battery reading.
-
-Closing a browser tab does not stop the experiment; the runner belongs to the launcher process. Use **Stop** when you want to pause intentionally. Press `Ctrl+C` in the launcher window for a clean application shutdown.
+See [SECURITY.md](SECURITY.md) for reporting and operational guidance.
 
 ## Configuration
 
-Committed production defaults live in [`config.toml`](config.toml). Put machine-specific overrides in an untracked `config.local.toml`; the loader deep-merges it over the committed file.
+Committed defaults are in [`config.toml`](config.toml). Put machine-specific overrides in untracked `config.local.toml`; the loader deep-merges the local file over the committed defaults.
 
-For a short exercise, copy `config.dev.example.toml` to `config.local.toml`:
+For a short development exercise:
 
 ```bat
 copy config.dev.example.toml config.local.toml
 ```
 
-The example uses one-minute tests, short recovery, and frequent polling. Delete `config.local.toml` to return to production defaults.
+Delete `config.local.toml` to return to the committed defaults.
 
-Configurable groups include:
+The main groups are `[server]`, `[blink]`, `[experiment]`, `[paths]`, and `[media]`. Invalid ports, unknown keys, non-positive timing values, and an experiment layout other than three snapshot tests followed by one stream test fail fast.
 
-- `[server]`: dashboard host/port and explicit LAN opt-in.
-- `[blink]`: loopback HTTP/TCP endpoints, request timeouts, reconnect delay, and low-battery state names.
-- `[experiment]`: test/recovery durations, battery and measurement intervals, checkpoint cadence, stream-data inactivity timeout, fatal outage threshold, and the ordered test definitions. `stream_data_timeout_seconds` must be positive and no greater than `fatal_outage_seconds`.
-- `[paths]`: runtime, SQLite, latest JPEG, HLS, private, and log locations.
-- `[media]`: FFmpeg executable and HLS segment/list settings.
+## Local runtime data
 
-Unknown keys, invalid ports, non-positive intervals, or a test order other than three snapshot tests followed by one stream test stop startup with a clear configuration error.
-
-## Local files and retention
-
-The runtime layout is created automatically:
+The launcher creates mutable data under `runtime/`:
 
 ```text
 runtime/
@@ -135,12 +117,14 @@ runtime/
     adapter.log
   private/
     auth.dpapi
-    dashboard-access.token    # created only when LAN mode is enabled
+    dashboard-access.token    # LAN mode only
 ```
 
-SQLite uses WAL mode and schema migrations. It retains all run, phase, measurement, and event rows. The webpage bounds its recent error display, while the database and rotating application logs retain the underlying history. Application log files rotate at 5 MiB with five backups.
+SQLite uses WAL mode. Application logs rotate at 5 MiB with five backups. Experiment database growth is workload-dependent and is not capped by the project.
 
-The dashboard exposes the following loopback endpoints:
+## HTTP interface
+
+The dashboard exposes:
 
 ```text
 GET  /healthz
@@ -155,11 +139,11 @@ POST /api/experiment/restart
 POST /api/experiment/continue
 ```
 
-`/api/measurements?limit=100000` is also linked from the accessible history panel as a complete JSON download. Raw Blink battery fields remain labelled as raw values; only raw voltage is converted using `raw / 100` and displayed as volts.
+See [API reference](docs/API.md) for authentication, parameters, and stability notes.
 
-## Development and tests
+## Development and testing
 
-The normal user does not need these commands. For development from Bash/WSL or another shell with Python available:
+For development from a shell with Python available:
 
 ```text
 python -m venv .venv
@@ -170,38 +154,22 @@ node --check static/app.js
 
 On Windows, use `.venv\Scripts\python.exe` instead of `.venv/bin/python`.
 
-The test suite covers configuration validation, SQLite migrations and rollback, restart recovery, snapshot scheduling, low-battery transitions, timeout/failure classification, receipt-confirmed stream timing, zero-byte and FFmpeg fatal outages, stream checkpoints across restart, encrypted secret envelopes, saved-auth retry/prompt isolation, adapter contracts, JPEG/media behavior, HTTP APIs, supervisor readiness, static accessibility, local icons, and transitive stylesheet imports.
+The repository includes unit/integration-style tests for configuration, SQLite migrations, experiment transitions and restart recovery, stream timing/outages, encrypted secret envelopes, adapter contracts, HTTP APIs, media handling, supervisor readiness, and static UI behavior. These tests are not a substitute for a complete real-device, long-duration acceptance run.
 
-## Troubleshooting
+## Documentation
 
-**The launcher says Python was not found**
+- [Setup](docs/SETUP.md)
+- [Requirements](docs/REQUIREMENTS.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [API](docs/API.md)
+- [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Security](SECURITY.md)
+- [Contributing](CONTRIBUTING.md)
+- [Public-release checklist](docs/PUBLIC_RELEASE_CHECKLIST.md)
+- [Third-party browser notices](static/vendor/THIRD_PARTY_NOTICES.md)
 
-Install Python 3.10 or newer from python.org, enable the launcher/`PATH` option, then reopen Command Prompt.
+## License
 
-**Setup says FFmpeg was not found**
+Project-authored material is source-available under the Apache License 2.0 with the Commons Clause License Condition v1.0. The Commons Clause adds a restriction on selling the software itself, or a product/service whose value derives entirely or substantially from the software. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
 
-Confirm `ffmpeg -version` works in a newly opened Command Prompt. Merely placing FFmpeg elsewhere on disk is not enough; its `bin` directory must be on `PATH`.
-
-**Credentials cannot be decrypted**
-
-The encrypted file belongs to a different Windows user, or it is damaged. Close the application, remove `runtime/private/auth.dpapi`, and launch again to authenticate. Experiment data in `runtime/data/experiment.db` is unaffected.
-
-**Saved authentication keeps retrying**
-
-Blinkpy does not reliably distinguish rejected credentials from temporary network, throttling, service, or camera-discovery failures during startup. The dashboard therefore retains the last encrypted record and retries at 2, 4, 8, and then up to 60-second intervals instead of requesting the username/password again. Leave the launcher open while Blink recovers. MFA appears only after Blink explicitly requests it. If the account credentials really changed, close the dashboard, delete only `runtime/private/auth.dpapi`, and launch again for an intentional fresh sign-in.
-
-**The browser did not open**
-
-Leave the launcher running and open `http://127.0.0.1:8090` manually.
-
-**The configured port is already in use**
-
-If another compatible dashboard is already running, the launcher opens it. Otherwise, set a free `server.dashboard_port` in `config.local.toml`. Adapter ports must remain consistent with `blink.http_base_url` and `blink.stream_port`.
-
-**Camera output is stale**
-
-The timestamp below the camera is the last successfully received media time. Snapshot failures never replace the last valid JPEG. During stream startup or reconnection, the page intentionally falls back to the latest snapshot. The “Stream reception” and “Current stream outage” readings show whether bytes are currently arriving and how close the outage is to the fatal threshold; stalled time does not reduce the remaining valid stream-test duration.
-
-**Where are detailed failures?**
-
-Use the collapsible warnings/errors section first, then inspect `runtime/logs/application.log` and `runtime/logs/adapter.log`. Secrets and upstream private stream targets are redacted or suppressed.
+Bundled third-party browser assets remain under their own licenses. See [`static/vendor/THIRD_PARTY_NOTICES.md`](static/vendor/THIRD_PARTY_NOTICES.md).

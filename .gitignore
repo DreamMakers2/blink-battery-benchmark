@@ -1,41 +1,39 @@
-# local env files
-.env*.local
+# Python environments and packaging
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Local runtime data and private configuration
+runtime/
+config.local.toml
 .env
-.env.development
-.env.test
-.env.production
 .env.*
 !.env.example
 
-# temp directory
-.temp
-.tmp
-
-# agents directory
-/.agents
-/.codex
-
-# Vite files
-vite.config.js.timestamp-*
-vite.config.ts.timestamp-*
-.vite/
-
-# dependencies and generated artifacts
-/node_modules
-/dist
-/coverage
-/Demo Pages/
-/.venv/
-/runtime/
-/config.local.toml
-/htmlcov/
-/.pytest_cache/
-/__pycache__/
+# Python and test/tool caches
+__pycache__/
 *.py[cod]
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
 
-# editor and operating-system files
+# Logs and temporary files
+*.log
+*.tmp
+.temp/
+.tmp/
+
+# Editor and operating-system metadata
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db
-.idea/
-.vscode/
-*.log
+
+# Local agent/tool state
+/.agents/
+/.codex/
