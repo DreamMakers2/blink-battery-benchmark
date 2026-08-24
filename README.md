@@ -19,8 +19,6 @@ The project is independent and unofficial. It is not affiliated with, endorsed b
 
 ## 🧩 Architecture
 
-![Blink Battery Experiment Dashboard architecture](docs/architecture.svg)
-
 ```mermaid
 flowchart LR
     Browser["Browser UI"]
